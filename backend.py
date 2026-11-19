@@ -26,9 +26,11 @@ THRESHOLD_DEFAULT = 0.5
 # Jumlah jurnal teratas yang dikirim ke LLM (angka awal, bisa disetel tim).
 SUMMARY_TOP_K = 5
 # Batas waktu menunggu LLM sebelum dianggap gagal (detik).
-# Sengaja pendek: lebih baik fallback ke daftar jurnal daripada membuat
-# pengguna (atau demo) menunggu lama tanpa kepastian.
-LLM_TIMEOUT_SECONDS = 8
+# Diukur pada data asli (1.000 dokumen, gemini-3.5-flash-lite): panggilan
+# normal 1,3-7 detik, tetapi ekor latensi dan beberapa request bersamaan
+# bisa melewati 8 detik. 15 detik menutup hampir semua kasus tanpa membuat
+# pengguna menunggu terlalu lama saat LLM benar-benar tidak merespons.
+LLM_TIMEOUT_SECONDS = 15
 
 # Isi "arahan praktis" saat tidak ada jurnal yang lolos threshold.
 GUIDANCE = [
@@ -48,6 +50,10 @@ log = logging.getLogger("aisen.search")
 # Validasi startup (dari backend.py versi tim, dipertahankan)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Log sebelum membuka DB. Kalau direktori berada di network share
+    # (mis. \\wsl.localhost di Windows), SQLite/Chroma bisa menggantung
+    # tanpa pesan apa pun; log ini menandai tepat di mana ia berhenti.
+    log.info("Membuka ChromaDB di '%s'...", DB_PATH)
     client = chromadb.PersistentClient(path=DB_PATH)
 
     try:
@@ -81,13 +87,15 @@ async def lifespan(app: FastAPI):
             COLLECTION_NAME,
         )
 
+    # Unduhan model pertama bisa memakan beberapa menit; tanpa log ini
+    # startup terlihat seperti hang. Log ditulis SEBELUM import karena
+    # `import sentence_transformers` (torch) sendiri butuh belasan detik.
+    log.info("Memuat model embedding '%s' (unduhan pertama bisa lama)...", MODEL_NAME)
+
     # Import dipindah ke sini agar test yang tidak butuh model
     # tidak perlu memuat torch.
     from sentence_transformers import SentenceTransformer
 
-    # Unduhan model pertama bisa memakan beberapa menit; tanpa log ini
-    # startup terlihat seperti hang.
-    log.info("Memuat model embedding '%s' (unduhan pertama bisa lama)...", MODEL_NAME)
     app.state.model = SentenceTransformer(MODEL_NAME)
     log.info("Model embedding siap.")
     app.state.summarize = summarize_with_llm  # mudah diganti saat test
@@ -256,6 +264,8 @@ def metadata_text(metadata: dict, key: str) -> str:
     kehilangan key (atau tipenya bukan string), jangan sampai seluruh
     pencarian jadi 500.
     """
+    if not metadata:  # None atau {} (dokumen tanpa metadata sama sekali)
+        return ""
     value = metadata.get(key)
     return "" if value is None else str(value)
 
