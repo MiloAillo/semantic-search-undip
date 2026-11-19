@@ -146,23 +146,33 @@ def build_prompt(query: str, results: list[SearchResult]) -> str:
         "Panjang maksimal 3 paragraf dan 180 kata. Utamakan poin paling relevan, "
         "hindari pengantar panjang dan jangan mengulang judul jurnal. "
         "Setiap klaim faktual wajib memiliki sitasi [n] sesuai nomor sumber. "
+        "Tulis sitasi satu per satu, misalnya [1] [2] [3], jangan digabung "
+        "menjadi satu kurung seperti [1, 2, 3]. "
         "Gunakan Markdown sederhana hanya untuk penekanan penting (**teks**) bila perlu. "
         "Jika sumber tidak cukup, katakan secara singkat.\n\n"
         f"Pertanyaan pengguna: {query}\n\nSumber jurnal:\n{sources}"
     )
 
 
-_CITATION = re.compile(r"\[(\d+)\]")
+_CITATION = re.compile(r"\[(\d+(?:\s*,\s*\d+)*)\]")
 
 
 def sanitize_citations(text: str, valid: set[int]) -> str:
-    """Buang sitasi [n] yang nomornya tidak ada di sumber yang dikirim ke LLM."""
+    """Buang sitasi [n] yang nomornya tidak ada di sumber yang dikirim ke LLM.
+
+    Sitasi gabungan seperti [1, 2, 3] dipecah menjadi [1] [2] [3] agar setiap
+    nomor bisa diklik satu per satu di UI.
+    """
 
     def keep(m: re.Match) -> str:
-        if int(m.group(1)) in valid:
-            return m.group(0)
-        log.warning("Sitasi tidak valid dibuang: %s", m.group(0))
-        return ""
+        nomor = [int(n) for n in m.group(1).split(",")]
+        dipakai = [n for n in nomor if n in valid]
+
+        for n in nomor:
+            if n not in valid:
+                log.warning("Sitasi tidak valid dibuang: [%s]", n)
+
+        return " ".join(f"[{n}]" for n in dipakai)
 
     return _CITATION.sub(keep, text)
 
