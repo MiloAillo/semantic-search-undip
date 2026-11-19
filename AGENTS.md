@@ -10,7 +10,7 @@ One small service: FastAPI semantic search over harvested Universitas Diponegoro
 ## Data prerequisites (the #1 startup failure)
 
 - `./eprints_vector_db` is gitignored and required at startup. If absent, the app fails to boot (`RuntimeError` in `backend.py`).
-- Ingest by running the notebook top to bottom: harvest OAI-PMH (`https://v.undip.ac.id/cgi/oai2`, `metadataPrefix=oai_dc`, target 1000 valid records) → writes `eprints_undip_clean.json` → embeds `"{title}. {description}"` and inserts into Chroma.
+- Ingest by running the notebook top to bottom: harvest OAI-PMH (`https://eprints.undip.ac.id/cgi/oai2`, `metadataPrefix=oai_dc`, target 1000 valid records) → writes `eprints_undip_clean.json` → embeds `"{title}. {description}"` and inserts into Chroma.
 - The notebook **deletes and recreates** collection `undip_research_search` with `{"hnsw:space": "cosine"}`. Re-running wipes existing vectors; there is no incremental update path.
 - Inserts are batched at 1000 because Chroma rejects larger batches (~5461 cap).
 - Notebook needs `sickle`, which is **not** in `requirements.txt` (installed via `%pip install` cell). Notebook also calls `%pip install sentence-transformers chromadb`.
