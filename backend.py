@@ -1,4 +1,7 @@
+import asyncio
 import logging
+import os
+import re
 import time
 from contextlib import asynccontextmanager
 from typing import Literal
@@ -14,17 +17,25 @@ DB_PATH = "./eprints_vector_db"
 COLLECTION_NAME = "undip_research_search"
 N_RESULTS = 100
 
-# [BARU] Jumlah jurnal teratas yang dikirim ke LLM (angka awal, bisa disetel tim).
-SUMMARY_TOP_K = 5
+# Threshold = kemiripan minimum (1 - jarak cosine). Makin tinggi = makin ketat.
+# Batas bawah/atas slider UI. NILAI AWAL, setel setelah mencoba data asli.
+THRESHOLD_MIN = 0.1
+THRESHOLD_MAX = 0.9
+THRESHOLD_DEFAULT = 0.5
 
-# [BARU] Isi "arahan praktis" saat tidak ada jurnal yang lolos threshold.
+# Jumlah jurnal teratas yang dikirim ke LLM (angka awal, bisa disetel tim).
+SUMMARY_TOP_K = 5
+# Batas waktu menunggu LLM sebelum dianggap gagal (detik).
+LLM_TIMEOUT_SECONDS = 20
+
+# Isi "arahan praktis" saat tidak ada jurnal yang lolos threshold.
 GUIDANCE = [
-    "Naikkan batas jarak (max_threshold) agar lebih longgar.",
+    "Turunkan threshold agar hasil lebih longgar.",
     "Coba kata kunci lain.",
     "Perluas topik pencarian.",
 ]
 
-# [BARU] Logging dasar untuk observability. Di bawah uvicorn, logger aplikasi
+# Logging dasar untuk observability. Di bawah uvicorn, logger aplikasi
 # tidak otomatis aktif, jadi dikonfigurasi di sini.
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s"
@@ -46,21 +57,27 @@ async def lifespan(app: FastAPI):
             "you've run the data-ingestion step."
         ) from exc
 
-    # [BARU] Import dipindah ke sini agar test yang tidak butuh model
+    # Import dipindah ke sini agar test yang tidak butuh model
     # tidak perlu memuat torch.
     from sentence_transformers import SentenceTransformer
 
     app.state.model = SentenceTransformer(MODEL_NAME)
-    app.state.summarize = summarize_with_llm  # [BARU] mudah diganti saat test
+    app.state.summarize = summarize_with_llm  # mudah diganti saat test
+    if not (os.getenv("GEMINI_API_KEY") and os.getenv("GEMINI_MODEL")):
+        log.warning(
+            "GEMINI_API_KEY / GEMINI_MODEL belum diatur: ringkasan AI nonaktif, "
+            "API hanya mengembalikan daftar jurnal."
+        )
     yield
 
 
 app = FastAPI(
     title="Undip Research Semantic Search API",
     description="Semantic search over the harvested Undip eprints repository.",
-    version="1.1.0",
+    version="0.2.0",
     lifespan=lifespan,
 )
+
 
 app.add_middleware(
     CORSMiddleware,
@@ -70,22 +87,24 @@ app.add_middleware(
     allow_headers=["Content-Type"],
 )
 
+
 class SearchRequest(BaseModel):
-    # [BARU] Spasi di awal/akhir dibuang, jadi query "   " ditolak (min_length=1).
+    # Spasi di awal/akhir dibuang, jadi query "   " ditolak (min_length=1).
     model_config = ConfigDict(str_strip_whitespace=True)
 
     query: str = Field(..., min_length=1, description="Free-text search query (Indonesian or English).")
-    max_threshold: float = Field(
-        default=0.5,
-        ge=0.0,
-        le=2.0,
-        description="Maximum cosine distance allowed for a result (lower = stricter).",
+    # BERUBAH: dulu `max_threshold` (jarak, makin kecil makin ketat).
+    threshold: float = Field(
+        default=THRESHOLD_DEFAULT,
+        ge=THRESHOLD_MIN,
+        le=THRESHOLD_MAX,
+        description="Minimum similarity (1 - cosine distance). Higher = stricter.",
     )
 
 
 class SearchResult(BaseModel):
     peringkat: int
-    skor: float
+    skor: float  # BERUBAH: kemiripan (makin tinggi makin mirip), bukan jarak
     judul: str
     penulis: str
     deskripsi: str
@@ -95,21 +114,22 @@ class SearchResult(BaseModel):
 
 class SearchResponse(BaseModel):
     query: str
-    max_threshold: float
+    threshold: float  # BERUBAH: dulu `max_threshold`
     count: int
     results: list[SearchResult]
-    # [BARU] Field tambahan (frontend lama tetap kompatibel):
+    # Field tambahan:
     #   full       -> ringkasan AI + daftar jurnal
-    #   list_only  -> LLM gagal, daftar jurnal saja
+    #   list_only  -> LLM gagal, daftar jurnal saja (alasannya di `ringkasan_error`)
     #   no_results -> tidak ada jurnal lolos threshold, lihat `arahan`
     status: Literal["full", "list_only", "no_results"]
     ringkasan: str | None = None  # sitasi berformat [n], n = `peringkat`
+    ringkasan_error: str | None = None  # pesan untuk pengguna; coba lagi manual
     arahan: list[str] = []
 
 
-# [BARU] ---- LLM -------------------------------------------------------------
+# ---- LLM (Google Gemini API) -----------------------------------------------
 class LLMError(Exception):
-    pass
+    """Pesan exception ini ditampilkan ke pengguna, jadi tulis dalam Indonesia."""
 
 
 def build_prompt(query: str, results: list[SearchResult]) -> str:
@@ -122,16 +142,55 @@ def build_prompt(query: str, results: list[SearchResult]) -> str:
     )
 
 
+_CITATION = re.compile(r"\[(\d+)\]")
+
+
+def sanitize_citations(text: str, valid: set[int]) -> str:
+    """Buang sitasi [n] yang nomornya tidak ada di sumber yang dikirim ke LLM."""
+
+    def keep(m: re.Match) -> str:
+        if int(m.group(1)) in valid:
+            return m.group(0)
+        log.warning("Sitasi tidak valid dibuang: %s", m.group(0))
+        return ""
+
+    return _CITATION.sub(keep, text)
+
+
 def summarize_with_llm(query: str, results: list[SearchResult]) -> str:
-    """TODO: sambungkan ke LLM yang dipilih tim (pakai build_prompt).
-    Fungsi ini HARUS raise exception bila gagal atau timeout; API lalu
-    otomatis memakai jalur fallback 'list_only'."""
-    raise LLMError("LLM belum dikonfigurasi")
+    """Panggil Gemini. Tanpa retry otomatis: gagal -> LLMError, pengguna
+    mencoba lagi secara manual."""
+    api_key = os.getenv("GEMINI_API_KEY")
+    model = os.getenv("GEMINI_MODEL")
+    if not (api_key and model):
+        raise LLMError("Ringkasan AI belum dikonfigurasi.")
+
+    from google import genai
+    from google.genai import errors as genai_errors
+
+    try:
+        client = genai.Client(api_key=api_key)
+        resp = client.models.generate_content(
+            model=model, contents=build_prompt(query, results)
+        )
+    except genai_errors.APIError as exc:
+        if exc.code == 429:
+            raise LLMError(
+                "Kuota atau batas permintaan LLM tercapai. Coba lagi sebentar lagi."
+            ) from exc
+        raise LLMError(
+            f"Layanan LLM mengembalikan error ({exc.code}). Coba lagi."
+        ) from exc
+
+    text = (resp.text or "").strip()
+    if not text:
+        raise LLMError("LLM tidak menghasilkan ringkasan. Coba lagi.")
+    return sanitize_citations(text, {r.peringkat for r in results})
 
 
 @app.get("/health")
 def health() -> dict:
-    # [BARU] Untuk pengecekan hidup/mati dan jumlah dokumen ter-index.
+    # Untuk pengecekan hidup/mati dan jumlah dokumen ter-index.
     return {"status": "ok", "documents": app.state.collection.count()}
 
 
@@ -154,13 +213,14 @@ async def search(payload: SearchRequest) -> SearchResponse:
     results: list[SearchResult] = []
     rank = 0
     for metadata, distance in zip(raw["metadatas"][0], raw["distances"][0]):
-        if distance > payload.max_threshold:
+        similarity = round(1.0 - distance, 6)  # dibulatkan agar perbandingan stabil
+        if similarity < payload.threshold:
             continue
         rank += 1
         results.append(
             SearchResult(
                 peringkat=rank,
-                skor=distance,
+                skor=similarity,
                 judul=metadata["title"],
                 penulis=metadata["creators"],
                 deskripsi=metadata["description"],
@@ -169,37 +229,50 @@ async def search(payload: SearchRequest) -> SearchResponse:
             )
         )
 
-    # [BARU] Cabang flowchart setelah threshold
+    # Cabang flowchart setelah threshold
     ringkasan = None
+    ringkasan_error = None
     arahan: list[str] = []
     if not results:
         status = "no_results"
         arahan = GUIDANCE
     else:
         try:
-            ringkasan = await run_in_threadpool(
-                app.state.summarize, payload.query, results[:SUMMARY_TOP_K]
+            ringkasan = await asyncio.wait_for(
+                run_in_threadpool(
+                    app.state.summarize, payload.query, results[:SUMMARY_TOP_K]
+                ),
+                timeout=LLM_TIMEOUT_SECONDS,
             )
             status = "full"
-        except Exception:
-            log.exception("LLM gagal, fallback ke daftar jurnal saja")
-            ringkasan = None
+        except asyncio.TimeoutError:
+            log.warning("LLM timeout setelah %ss", LLM_TIMEOUT_SECONDS)
             status = "list_only"
+            ringkasan_error = "LLM tidak merespons tepat waktu. Coba lagi."
+        except LLMError as exc:
+            log.warning("LLM gagal: %s", exc)
+            status = "list_only"
+            ringkasan_error = str(exc)
+        except Exception:
+            log.exception("LLM gagal (error tak terduga)")
+            status = "list_only"
+            ringkasan_error = "Ringkasan gagal dibuat. Coba lagi."
 
     log.info(
-        "search status=%s count=%d max_threshold=%.2f duration_ms=%.0f",
+        "search status=%s count=%d threshold=%.2f duration_ms=%.0f",
         status,
         len(results),
-        payload.max_threshold,
+        payload.threshold,
         (time.perf_counter() - started) * 1000,
     )
 
     return SearchResponse(
         query=payload.query,
-        max_threshold=payload.max_threshold,
+        threshold=payload.threshold,
         count=len(results),
         results=results,
         status=status,
         ringkasan=ringkasan,
+        ringkasan_error=ringkasan_error,
         arahan=arahan,
     )
