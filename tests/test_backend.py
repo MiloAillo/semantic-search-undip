@@ -139,6 +139,21 @@ def test_metadata_tidak_lengkap_tidak_menyebabkan_error():
     assert hasil["penulis"] == "" and hasil["url"] == "" and hasil["date"] == ""
 
 
+def test_metadata_none_tidak_menyebabkan_error():
+    # Chroma mengembalikan metadata=None untuk dokumen tanpa metadata sama sekali.
+    body = make_client([0.1], metadatas=[None]).post("/search", json={"query": "x"}).json()
+    assert body["status"] != "no_results"
+    assert body["results"][0] == {
+        "peringkat": 1,
+        "skor": 0.9,
+        "judul": "",
+        "penulis": "",
+        "deskripsi": "",
+        "url": "",
+        "date": "",
+    }
+
+
 def test_hasil_lengkap_tidak_mengisi_skor_tertinggi():
     body = make_client([0.1]).post("/search", json={"query": "x"}).json()
     assert body["skor_tertinggi"] is None
