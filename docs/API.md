@@ -199,7 +199,7 @@ Possible `ringkasan_error` values (user-facing, Indonesian):
 | `Model LLM '<name>' tidak ditemukan. Periksa nilai GEMINI_MODEL.` | HTTP 404 — usually a retired/wrong model name |
 | `Layanan LLM mengembalikan error (<code>). Coba lagi.` | Any other Gemini API error |
 | `LLM tidak menghasilkan ringkasan. Coba lagi.` | Empty completion |
-| `LLM tidak merespons tepat waktu. Coba lagi.` | Exceeded `LLM_TIMEOUT_SECONDS` (8 s) |
+| `LLM tidak merespons tepat waktu. Coba lagi.` | Exceeded `LLM_TIMEOUT_SECONDS` (15 s) |
 | `Ringkasan gagal dibuat. Coba lagi.` | Unexpected exception; details stay in the server log |
 
 There is no automatic retry. The client decides whether to retry.
@@ -358,7 +358,7 @@ frontend may run on any port. Before publishing the service, replace
 | Candidates fetched per query | 100 | `N_RESULTS = 100` |
 | Results returned | up to 100 | no pagination |
 | Results sent to the LLM | 5 | `SUMMARY_TOP_K = 5` |
-| LLM wait before fallback | 8 s | `LLM_TIMEOUT_SECONDS = 8` |
+| LLM wait before fallback | 15 s | `LLM_TIMEOUT_SECONDS = 15` |
 | `query` minimum length | 1 character after trim | `SearchRequest` |
 | `threshold` range | 0.1 – 0.9, default 0.5 | `THRESHOLD_MIN/MAX/DEFAULT` |
 | Cold start (first boot) | minutes | embedding-model download |
@@ -379,7 +379,7 @@ Useful for frontend clients written against an earlier build.
 | AI summary | none | optional, `status` reflects whether it was produced |
 | `/health` | `{status, documents}` | adds `llm_configured`, `metric` |
 | Metadata handling | direct indexing, `KeyError` possible | missing fields become `""` |
-| LLM timeout | 20 s | 8 s |
+| LLM timeout | 20 s → 8 s | 15 s (measured: real calls run 1–7 s with a tail past 8 s) |
 
 See [DEMO.md](DEMO.md) for the operational checklist and [DATA.md](DATA.md) for
 how the collection must be built for these scores to mean anything.

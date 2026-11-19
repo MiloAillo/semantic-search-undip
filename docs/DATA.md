@@ -11,7 +11,7 @@ path.
 ## Pipeline overview
 
 ```
-OAI-PMH (v.undip.ac.id/cgi/oai2)
+OAI-PMH (eprints.undip.ac.id/cgi/oai2)
         │  harvest + filter
         ▼
 eprints_undip_clean.json          (~1,000 records)
@@ -24,11 +24,11 @@ eprints_vector_db/                 ChromaDB, collection "undip_research_search"
 
 | Setting | Value |
 |---|---|
-| Endpoint | `https://v.undip.ac.id/cgi/oai2` |
+| Endpoint | `https://eprints.undip.ac.id/cgi/oai2` |
 | Metadata format | `oai_dc` |
 | Client | `sickle` |
 | Target | 1,000 valid records |
-| Observed | 1,000 kept out of 5,035 scanned |
+| Observed | 1,000 kept out of 1,152 scanned |
 
 A record is kept when **all** of these hold:
 
@@ -134,3 +134,4 @@ notebook's first cell and is only needed for harvesting.
 | `documents: 0` in `/health` after ingest | Wrong `DB_PATH` (relative to CWD) | Run the notebook and the server from the repo root |
 | Search results look random | Collection not built with `hnsw:space=cosine` | Recreate the collection (cell 3) |
 | Docker sees no data | `./eprints_vector_db` missing on the host | Build it on the host; compose bind-mounts it |
+| Container exits with `attempt to write a readonly database` | The bind-mounted DB is owned by your UID, the image runs as UID 10001 | `chmod -R a+rwX eprints_vector_db` on the host |

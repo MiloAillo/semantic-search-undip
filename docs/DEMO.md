@@ -19,6 +19,12 @@ when something does not cooperate. Written for the prototype as it exists today.
   The first start takes minutes; later starts take seconds. Do not clear the
   HuggingFace cache. If you demo via Docker, use the same machine and keep the
   `model_cache` volume.
+- [ ] If you demo via Docker, make the DB writable by the container's user once:
+  ```bash
+  chmod -R a+rwX eprints_vector_db
+  ```
+  The image runs as UID 10001, so a bind mount owned by your own UID fails at
+  startup with `attempt to write a readonly database`.
 - [ ] Check all three health facts in one call:
   ```bash
   curl http://localhost:8000/health
@@ -59,9 +65,14 @@ when something does not cooperate. Written for the prototype as it exists today.
 
 | Purpose | Query | Expected |
 |---|---|---|
-| Main demo (Indonesian) | `faktor risiko stunting pada balita` | `full`, several papers, summary with `[1]` citations |
-| Cross-language (English) | `machine learning for sentiment analysis` | `full` — shows the model is multilingual |
-| Deliberate `no_results` | `faktor risiko stunting` with `"threshold": 0.85` | `no_results`, `skor_tertinggi` around 0.4–0.6, `arahan` telling you to lower the threshold |
+| Main demo (Indonesian) | `analisis kualitas air sungai` | `full`, ~16 papers, summary with `[1]` citations |
+| Cross-language (English) | `coral reef ecosystem` | `full`, ~30 papers — shows the model is multilingual |
+| Deliberate `no_results` | `faktor risiko stunting` with `"threshold": 0.85` | `no_results`, `skor_tertinggi` around 0.5, `arahan` telling you to lower the threshold |
+
+All three were verified against the 1,000-record corpus. Avoid long, very specific
+English phrases such as `machine learning for sentiment analysis`: this repository
+is dominated by older Indonesian-language papers, so such queries land around
+0.41 and return `no_results` at the default threshold.
 
 Show the third one on purpose: it demonstrates that the API explains itself
 instead of looking broken, and that the threshold is a real, tunable knob.
@@ -73,6 +84,7 @@ instead of looking broken, and that the threshold is a real, tunable knob.
 | Model starts downloading | "It caches the model on first run" | Wait; it is a one-time cost |
 | `status=list_only` with a quota message | "The search still works; the AI layer is rate-limited" | Show the ranked list — that is the fallback design, not a failure |
 | `status=list_only` with "belum dikonfigurasi" | `.env` not loaded — usually a missing `--env-file .env` | Restart with the flag |
+| `status=list_only` with "tidak merespons tepat waktu" | Gemini was slower than 15 s | Say "the model is slow, here is the list", then retry the query |
 | Empty results on everything | Threshold is too strict, or DB is missing | Lower the threshold live; check `/health` |
 | Server will not start (`collection ... was not found`) | Wrong directory or missing DB | Start uvicorn from the repo root; if the DB is missing, switch to screenshots |
 | Network is down | Gemini is unreachable | Screenshots of a `full` response; the retrieval path works offline |
@@ -81,7 +93,7 @@ instead of looking broken, and that the threshold is a real, tunable knob.
 
 Answers that are honest and short. Do not overclaim.
 
-- **How many papers?** 1,000 indexed, selected from about 5,035 records scanned in
+- **How many papers?** 1,000 indexed, selected from about 1,150 records scanned in
   the OAI feed — an early-page sample, not a random one.
 - **How does search work?** The query and each paper (title + abstract) are
   embedded with the same multilingual model; we rank by cosine similarity and
@@ -89,9 +101,13 @@ Answers that are honest and short. Do not overclaim.
 - **Why do you truncate abstracts?** The model handles 128 tokens, so vectors
   represent the title plus the start of the abstract. A production version would
   chunk or summarize first.
-- **Why is the threshold 0.5?** It is a placeholder; `calibrate_threshold.py`
-  measures real scores and suggests a value. If the demo threshold looks
-  arbitrary, that is exactly what the script fixes.
+- **Why is the threshold 0.5?** Measured on this corpus: phrase queries put the
+  best hit at 0.57–0.68, a single word lands at 0.49, and off-topic text at 0.44.
+  So 0.5 keeps phrases and rejects noise. `calibrate_threshold.py` reproduces
+  those numbers.
+- **Why did "stunting" return nothing?** One-word queries score lower than
+  phrases (0.49 vs 0.57–0.68). Say the query as a phrase, or lower the threshold
+  live — the `arahan` field already reports the best score found.
 - **What if Gemini fails?** The response degrades to `list_only` with a reason in
   `ringkasan_error`; searching never depends on the LLM. There is no automatic
   retry — the user retries.
