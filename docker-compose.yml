@@ -1,6 +1,12 @@
 services:
   aisen-api:
-    build: .
+    build:
+      context: .
+      args:
+        # Samakan dengan UID host agar bind-mount ./eprints_vector_db bisa
+        # ditulis container. Linux/WSL: APP_UID=$(id -u) docker compose up
+        # PowerShell: $env:APP_UID=1000; docker compose up
+        APP_UID: ${APP_UID:-10001}
     env_file: .env
     ports:
       - "8000:8000"
@@ -8,6 +14,18 @@ services:
       - ./eprints_vector_db:/app/eprints_vector_db
       - model_cache:/model-cache
     restart: unless-stopped
+    healthcheck:
+      # `docker compose up --wait` menunggu ini, bukan sekadar container start.
+      test:
+        - CMD
+        - python
+        - -c
+        - import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=5).status == 200 else 1)
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      # Muat model pertama kali bisa ~70 detik.
+      start_period: 120s
 
 volumes:
   model_cache:
