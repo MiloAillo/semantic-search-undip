@@ -16,31 +16,37 @@ class FakeModel:
 class FakeCollection:
     """`distances` = jarak cosine yang dikembalikan ChromaDB (urut naik)."""
 
-    def __init__(self, distances):
+    metadata = {"hnsw:space": "cosine"}
+
+    def __init__(self, distances, metadatas=None):
         self.distances = distances
+        self.metadatas = metadatas
 
     def query(self, query_embeddings, n_results, include):
-        metas = [
-            {
-                "title": f"Judul {i}",
-                "creators": "A, B",
-                "description": f"Abstrak {i}",
-                "url": f"http://x/{i}.pdf",
-                "date": "2021",
-            }
-            for i in range(len(self.distances))
-        ]
+        if self.metadatas is not None:
+            metas = self.metadatas
+        else:
+            metas = [
+                {
+                    "title": f"Judul {i}",
+                    "creators": "A, B",
+                    "description": f"Abstrak {i}",
+                    "url": f"http://x/{i}.pdf",
+                    "date": "2021",
+                }
+                for i in range(len(self.distances))
+            ]
         return {"metadatas": [metas], "distances": [self.distances]}
 
     def count(self):
         return len(self.distances)
 
 
-def make_client(distances, summarize=None):
+def make_client(distances, summarize=None, metadatas=None):
     # TestClient dipakai TANPA `with`, jadi lifespan (model + ChromaDB asli)
     # tidak dijalankan; komponen diganti dengan yang palsu.
     backend.app.state.model = FakeModel()
-    backend.app.state.collection = FakeCollection(distances)
+    backend.app.state.collection = FakeCollection(distances, metadatas)
     backend.app.state.summarize = summarize or (lambda q, r: "Ringkasan [1]")
     return TestClient(backend.app)
 
@@ -90,6 +96,52 @@ def test_tidak_ada_jurnal_lolos_memberi_arahan():
     assert body["status"] == "no_results"
     assert body["count"] == 0 and body["results"] == []
     assert body["arahan"] and body["ringkasan"] is None
+
+
+def test_no_results_menyebut_skor_tertinggi():
+    # jarak 0.9 -> kemiripan 0.099...; threshold 0.5 tidak meloloskan apa pun.
+    body = make_client([0.9]).post(
+        "/search", json={"query": "x", "threshold": 0.5}
+    ).json()
+    assert body["skor_tertinggi"] == 0.1
+    assert "0.10" in body["arahan"][0]
+    assert "turunkan threshold" in body["arahan"][0]
+
+
+def test_cors_mengizinkan_frontend_dari_origin_lain():
+    # Demo bisa jalan dari port/host apa pun; preflight jangan diblokir.
+    r = make_client([0.1]).options(
+        "/search",
+        headers={
+            "Origin": "http://localhost:3000",
+            "Access-Control-Request-Method": "POST",
+        },
+    )
+    assert r.status_code == 200
+    assert r.headers["access-control-allow-origin"] == "*"
+
+
+def test_db_kosong_tidak_menyarankan_turunkan_threshold():
+    body = make_client([]).post("/search", json={"query": "x"}).json()
+    assert body["status"] == "no_results"
+    assert body["skor_tertinggi"] is None
+    assert "Belum ada dokumen" in body["arahan"][0]
+
+
+def test_metadata_tidak_lengkap_tidak_menyebabkan_error():
+    # Metadata notebook bisa berubah/bolong; respons harus tetap 200.
+    body = make_client(
+        [0.1], metadatas=[{"title": "Hanya judul"}]
+    ).post("/search", json={"query": "x"}).json()
+    assert body["status"] != "no_results"
+    hasil = body["results"][0]
+    assert hasil["judul"] == "Hanya judul"
+    assert hasil["penulis"] == "" and hasil["url"] == "" and hasil["date"] == ""
+
+
+def test_hasil_lengkap_tidak_mengisi_skor_tertinggi():
+    body = make_client([0.1]).post("/search", json={"query": "x"}).json()
+    assert body["skor_tertinggi"] is None
 
 
 def test_hasil_lengkap_dengan_ringkasan():
@@ -197,6 +249,16 @@ def test_llm_429_jadi_pesan_kuota(monkeypatch):
         backend.summarize_with_llm("x", _hasil(2))
 
 
+def test_llm_model_tidak_dikenal_jadi_pesan_jelas(monkeypatch):
+    # 404 biasanya berarti GEMINI_MODEL salah; pesannya harus menunjuk ke sana.
+    def raise_404():
+        raise genai_errors.APIError(404, {"error": {"message": "model not found"}})
+
+    _patch_client(monkeypatch, raise_404)
+    with pytest.raises(backend.LLMError, match="GEMINI_MODEL"):
+        backend.summarize_with_llm("x", _hasil(2))
+
+
 def test_llm_teks_kosong_dianggap_gagal(monkeypatch):
     class Resp:
         text = "   "
@@ -217,11 +279,21 @@ def test_llm_sukses_dan_sitasi_tidak_valid_dibuang(monkeypatch):
 
 
 # ---------- lain-lain ----------
-def test_health():
+def test_health(monkeypatch):
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("GEMINI_MODEL", raising=False)
     assert make_client([0.1, 0.2, 0.3]).get("/health").json() == {
         "status": "ok",
         "documents": 3,
+        "llm_configured": False,
+        "metric": "cosine",
     }
+
+
+def test_health_menandai_llm_terkonfigurasi(monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "k")
+    monkeypatch.setenv("GEMINI_MODEL", "m")
+    assert make_client([0.1]).get("/health").json()["llm_configured"] is True
 
 
 def test_startup_gagal_jelas_bila_koleksi_tidak_ada(tmp_path, monkeypatch):

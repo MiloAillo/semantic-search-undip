@@ -35,9 +35,9 @@ docker compose up --build                  # serves backend.py on :8000 (needs .
 ## API contract
 
 - `POST /search`. Request `{query: str, min_length=1 (whitespace is stripped), threshold: float = 0.5, THRESHOLD_MIN <= threshold <= THRESHOLD_MAX}`.
-- `threshold` is a **minimum similarity** (`1 - cosine distance`); higher = stricter (matches the UI slider). Bounds are constants in `backend.py` (initial values 0.1 / 0.9, tune on real data).
-- Response `{query, threshold, count, results, status, ringkasan, ringkasan_error, arahan}`. `status` is `full` (AI summary + list), `list_only` (LLM failed or not configured; reason in `ringkasan_error`) or `no_results` (nothing passed the threshold; practical hints in `arahan`). Citations in `ringkasan` are `[n]` where n = `peringkat`; invalid numbers are stripped.
+- `threshold` is a **minimum similarity** (`1 - cosine distance`); higher = stricter (matches the UI slider). Bounds are constants in `backend.py` (initial values 0.1 / 0.9, tune on real data). `python calibrate_threshold.py` prints real top-5 scores for sample queries and suggests a `THRESHOLD_DEFAULT` — run it against the real DB before a demo, because 0.5 is only a guess.
+- Response `{query, threshold, count, results, status, ringkasan, ringkasan_error, skor_tertinggi, arahan}`. `status` is `full` (AI summary + list), `list_only` (LLM failed or not configured; reason in `ringkasan_error`) or `no_results` (nothing passed the threshold; `skor_tertinggi` is the best similarity found, `arahan` gives practical hints — the empty-DB case gets its own message). Citations in `ringkasan` are `[n]` where n = `peringkat`; invalid numbers are stripped.
 - Each result has **Indonesian keys**: `peringkat`, `skor`, `judul`, `penulis`, `deskripsi`, `url`, `date`. `skor` is a similarity (higher = closer), and `peringkat` is a dense rank computed after filtering. Only the top `SUMMARY_TOP_K` results are sent to the LLM.
-- `GET /health` returns `{status, documents}`.
+- `GET /health` returns `{status, documents, llm_configured, metric}`. `metric` should be `cosine`; anything else means stored vectors were built without `hnsw:space=cosine` and `skor` is not a similarity.
 - Always fetches `N_RESULTS = 100` then filters in Python. There is no pagination or `offset`.
 - Result construction indexes Chroma metadata directly (`metadata["title"]`, `["creators"]`, `["url"]`, `["description"]`, `["date"]`) — a missing metadata key raises `KeyError` per request. Metadata shape is owned by the ingestion notebook; change both together.

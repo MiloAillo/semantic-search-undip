@@ -26,7 +26,9 @@ THRESHOLD_DEFAULT = 0.5
 # Jumlah jurnal teratas yang dikirim ke LLM (angka awal, bisa disetel tim).
 SUMMARY_TOP_K = 5
 # Batas waktu menunggu LLM sebelum dianggap gagal (detik).
-LLM_TIMEOUT_SECONDS = 20
+# Sengaja pendek: lebih baik fallback ke daftar jurnal daripada membuat
+# pengguna (atau demo) menunggu lama tanpa kepastian.
+LLM_TIMEOUT_SECONDS = 8
 
 # Isi "arahan praktis" saat tidak ada jurnal yang lolos threshold.
 GUIDANCE = [
@@ -57,17 +59,49 @@ async def lifespan(app: FastAPI):
             "you've run the data-ingestion step."
         ) from exc
 
+    # Terlihat jelas di log: salah path DB / DB kosong jangan sampai
+    # baru ketahuan saat demo (gejalanya cuma "tidak ada hasil").
+    total_documents = app.state.collection.count()
+    log.info(
+        "ChromaDB siap: %d dokumen di koleksi '%s' (%s)",
+        total_documents,
+        COLLECTION_NAME,
+        DB_PATH,
+    )
+    if total_documents == 0:
+        log.warning(
+            "Koleksi '%s' KOSONG: semua pencarian akan mengembalikan "
+            "'no_results' meskipun kode berjalan normal.",
+            COLLECTION_NAME,
+        )
+    if (app.state.collection.metadata or {}).get("hnsw:space") != "cosine":
+        log.warning(
+            "Koleksi '%s' tidak memakai hnsw:space=cosine: skor kemiripan "
+            "bisa tidak valid (threshold 0.1-0.9 jadi tidak bermakna).",
+            COLLECTION_NAME,
+        )
+
     # Import dipindah ke sini agar test yang tidak butuh model
     # tidak perlu memuat torch.
     from sentence_transformers import SentenceTransformer
 
+    # Unduhan model pertama bisa memakan beberapa menit; tanpa log ini
+    # startup terlihat seperti hang.
+    log.info("Memuat model embedding '%s' (unduhan pertama bisa lama)...", MODEL_NAME)
     app.state.model = SentenceTransformer(MODEL_NAME)
+    log.info("Model embedding siap.")
     app.state.summarize = summarize_with_llm  # mudah diganti saat test
-    if not (os.getenv("GEMINI_API_KEY") and os.getenv("GEMINI_MODEL")):
+
+    gemini_model = os.getenv("GEMINI_MODEL")
+    if not (os.getenv("GEMINI_API_KEY") and gemini_model):
         log.warning(
             "GEMINI_API_KEY / GEMINI_MODEL belum diatur: ringkasan AI nonaktif, "
             "API hanya mengembalikan daftar jurnal."
         )
+    else:
+        # Nama model yang salah tidak membuat startup gagal; tanpa log ini
+        # ringkasan AI "menghilang" tanpa jejak.
+        log.info("Ringkasan AI aktif dengan model Gemini '%s'.", gemini_model)
     yield
 
 
@@ -79,12 +113,15 @@ app = FastAPI(
 )
 
 
+# Prototipe/demo: dibuka untuk semua origin karena API tidak memakai cookie
+# maupun kredensial. Kalau nanti dipublikasikan, ganti `allow_origins` dengan
+# origin frontend yang sebenarnya.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
-    allow_credentials=True,
-    allow_methods=["POST"],
-    allow_headers=["Content-Type"],
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 
@@ -124,7 +161,10 @@ class SearchResponse(BaseModel):
     status: Literal["full", "list_only", "no_results"]
     ringkasan: str | None = None  # sitasi berformat [n], n = `peringkat`
     ringkasan_error: str | None = None  # pesan untuk pengguna; coba lagi manual
-    arahan: list[str] = []
+    # Kemiripan tertinggi yang ditemukan walau tidak lolos threshold.
+    # Membantu menilai apakah threshold kebablasan ketat atau DB-nya kosong.
+    skor_tertinggi: float | None = None
+    arahan: list[str] = Field(default_factory=list)
 
 
 # ---- LLM (Google Gemini API) -----------------------------------------------
@@ -178,6 +218,11 @@ def summarize_with_llm(query: str, results: list[SearchResult]) -> str:
             raise LLMError(
                 "Kuota atau batas permintaan LLM tercapai. Coba lagi sebentar lagi."
             ) from exc
+        if exc.code == 404:
+            # Paling sering: GEMINI_MODEL salah/ sudah tidak tersedia.
+            raise LLMError(
+                f"Model LLM '{model}' tidak ditemukan. Periksa nilai GEMINI_MODEL."
+            ) from exc
         raise LLMError(
             f"Layanan LLM mengembalikan error ({exc.code}). Coba lagi."
         ) from exc
@@ -191,7 +236,28 @@ def summarize_with_llm(query: str, results: list[SearchResult]) -> str:
 @app.get("/health")
 def health() -> dict:
     # Untuk pengecekan hidup/mati dan jumlah dokumen ter-index.
-    return {"status": "ok", "documents": app.state.collection.count()}
+    # `llm_configured` membuat konfigurasi Gemini bisa dicek sebelum demo
+    # tanpa harus menembak /search; `metric` memastikan koleksi memakai cosine
+    # (kalau tidak, `skor` di /search tidak bermakna).
+    return {
+        "status": "ok",
+        "documents": app.state.collection.count(),
+        "llm_configured": bool(
+            os.getenv("GEMINI_API_KEY") and os.getenv("GEMINI_MODEL")
+        ),
+        "metric": (app.state.collection.metadata or {}).get("hnsw:space"),
+    }
+
+
+def metadata_text(metadata: dict, key: str) -> str:
+    """Ambil metadata dengan aman.
+
+    Bentuk metadata dimiliki notebook ingestion. Kalau satu dokumen saja
+    kehilangan key (atau tipenya bukan string), jangan sampai seluruh
+    pencarian jadi 500.
+    """
+    value = metadata.get(key)
+    return "" if value is None else str(value)
 
 
 @app.post("/search", response_model=SearchResponse)
@@ -221,21 +287,38 @@ async def search(payload: SearchRequest) -> SearchResponse:
             SearchResult(
                 peringkat=rank,
                 skor=similarity,
-                judul=metadata["title"],
-                penulis=metadata["creators"],
-                deskripsi=metadata["description"],
-                url=metadata["url"],
-                date=metadata["date"],
+                judul=metadata_text(metadata, "title"),
+                penulis=metadata_text(metadata, "creators"),
+                deskripsi=metadata_text(metadata, "description"),
+                url=metadata_text(metadata, "url"),
+                date=metadata_text(metadata, "date"),
             )
         )
 
     # Cabang flowchart setelah threshold
     ringkasan = None
     ringkasan_error = None
+    skor_tertinggi: float | None = None
     arahan: list[str] = []
     if not results:
         status = "no_results"
-        arahan = GUIDANCE
+        distances = raw["distances"][0] if raw["distances"] else []
+        if distances:
+            # Kasus paling umum: threshold terlalu ketat. Sebutkan angka
+            # nyatanya supaya pengguna (atau panitia demo) tahu harus ke mana.
+            skor_tertinggi = round(1.0 - distances[0], 6)
+            arahan = [
+                f"Kemiripan tertinggi yang ditemukan {skor_tertinggi:.2f}; "
+                "turunkan threshold di bawah nilai itu.",
+                *GUIDANCE[1:],
+            ]
+        else:
+            # DB kosong / belum di-ingest: jangan menyarankan menurunkan
+            # threshold, itu menyesatkan.
+            arahan = [
+                "Belum ada dokumen terindeks di basis data.",
+                "Jalankan notebook data_harvesting untuk mengisi basis data.",
+            ]
     else:
         try:
             ringkasan = await asyncio.wait_for(
@@ -274,5 +357,6 @@ async def search(payload: SearchRequest) -> SearchResponse:
         status=status,
         ringkasan=ringkasan,
         ringkasan_error=ringkasan_error,
+        skor_tertinggi=skor_tertinggi,
         arahan=arahan,
     )
