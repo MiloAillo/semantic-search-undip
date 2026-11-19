@@ -7,10 +7,14 @@ from contextlib import asynccontextmanager
 from typing import Literal
 
 import chromadb
+import uvicorn
+from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 from starlette.concurrency import run_in_threadpool
+
+load_dotenv()
 
 MODEL_NAME = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 DB_PATH = "./eprints_vector_db"
@@ -93,9 +97,10 @@ class SearchRequest(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
 
     query: str = Field(..., min_length=1, description="Free-text search query (Indonesian or English).")
-    # BERUBAH: dulu `max_threshold` (jarak, makin kecil makin ketat).
-    threshold: float = Field(
+    max_threshold: float = Field(
         default=THRESHOLD_DEFAULT,
+        validation_alias=AliasChoices("max_threshold", "threshold"),
+        serialization_alias="max_threshold",
         ge=THRESHOLD_MIN,
         le=THRESHOLD_MAX,
         description="Minimum similarity (1 - cosine distance). Higher = stricter.",
@@ -114,7 +119,7 @@ class SearchResult(BaseModel):
 
 class SearchResponse(BaseModel):
     query: str
-    threshold: float  # BERUBAH: dulu `max_threshold`
+    max_threshold: float
     count: int
     results: list[SearchResult]
     # Field tambahan:
@@ -135,10 +140,15 @@ class LLMError(Exception):
 def build_prompt(query: str, results: list[SearchResult]) -> str:
     sources = "\n\n".join(f"[{r.peringkat}] {r.judul}\n{r.deskripsi}" for r in results)
     return (
-        "Jawab pertanyaan berdasarkan HANYA sumber di bawah ini. "
-        "Setiap klaim wajib diberi sitasi berformat [n] sesuai nomor sumber. "
-        "Jika sumber tidak cukup, katakan demikian.\n\n"
-        f"Pertanyaan: {query}\n\nSumber:\n{sources}"
+        "Anda adalah asisten riset. Tulis ringkasan singkat dalam bahasa Indonesia "
+        "tentang isi, temuan utama, atau pola yang muncul dari jurnal yang disajikan. "
+        "Gunakan HANYA sumber di bawah ini; jangan menambah fakta atau angka. "
+        "Panjang maksimal 3 paragraf dan 180 kata. Utamakan poin paling relevan, "
+        "hindari pengantar panjang dan jangan mengulang judul jurnal. "
+        "Setiap klaim faktual wajib memiliki sitasi [n] sesuai nomor sumber. "
+        "Gunakan Markdown sederhana hanya untuk penekanan penting (**teks**) bila perlu. "
+        "Jika sumber tidak cukup, katakan secara singkat.\n\n"
+        f"Pertanyaan pengguna: {query}\n\nSumber jurnal:\n{sources}"
     )
 
 
@@ -210,24 +220,25 @@ async def search(payload: SearchRequest) -> SearchResponse:
         include=["metadatas", "distances"],
     )
 
-    results: list[SearchResult] = []
-    rank = 0
+    matched: list[tuple[float, dict]] = []
     for metadata, distance in zip(raw["metadatas"][0], raw["distances"][0]):
-        similarity = round(1.0 - distance, 6)  # dibulatkan agar perbandingan stabil
-        if similarity < payload.threshold:
-            continue
-        rank += 1
-        results.append(
-            SearchResult(
-                peringkat=rank,
-                skor=similarity,
-                judul=metadata["title"],
-                penulis=metadata["creators"],
-                deskripsi=metadata["description"],
-                url=metadata["url"],
-                date=metadata["date"],
-            )
+        similarity = round(1.0 - distance, 6)
+        if similarity >= payload.max_threshold:
+            matched.append((distance, metadata))
+
+    matched.sort(key=lambda item: item[0])
+    results = [
+        SearchResult(
+            peringkat=rank,
+            skor=round(1.0 - distance, 6),
+            judul=metadata["title"],
+            penulis=metadata["creators"],
+            deskripsi=metadata["description"],
+            url=metadata["url"],
+            date=metadata["date"],
         )
+        for rank, (distance, metadata) in enumerate(matched, start=1)
+    ]
 
     # Cabang flowchart setelah threshold
     ringkasan = None
@@ -262,13 +273,13 @@ async def search(payload: SearchRequest) -> SearchResponse:
         "search status=%s count=%d threshold=%.2f duration_ms=%.0f",
         status,
         len(results),
-        payload.threshold,
+        payload.max_threshold,
         (time.perf_counter() - started) * 1000,
     )
 
     return SearchResponse(
         query=payload.query,
-        threshold=payload.threshold,
+        max_threshold=payload.max_threshold,
         count=len(results),
         results=results,
         status=status,
@@ -276,3 +287,7 @@ async def search(payload: SearchRequest) -> SearchResponse:
         ringkasan_error=ringkasan_error,
         arahan=arahan,
     )
+
+
+if __name__ == "__main__":
+    uvicorn.run("backend:app", host="127.0.0.1", port=8000)
