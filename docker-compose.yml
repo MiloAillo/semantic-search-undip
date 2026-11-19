@@ -1,0 +1,13 @@
+services:
+  aisen-api:
+    build: .
+    env_file: .env
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./eprints_vector_db:/app/eprints_vector_db
+      - model_cache:/model-cache
+    restart: unless-stopped
+
+volumes:
+  model_cache:

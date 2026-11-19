@@ -1,0 +1,43 @@
+# AGENTS.md
+
+## What this repo is
+
+One small service: FastAPI semantic search over harvested Universitas Diponegoro (Undip) eprints. Flat layout, no packages, no CI, no lockfile. Tests live in `tests/` (pytest, fake model/collection, no model download). Python 3.11.
+
+- `backend.py` — the service (also what the Dockerfile serves: `CMD uvicorn backend:app`): async endpoint, embedding/query offloaded via `run_in_threadpool`, explicit `RuntimeError` at startup when the Chroma collection is missing, Gemini summary with citations and fallback to list-only.
+- `data_harvesting.ipynb` — the only data ingestion path. Not run by the app, not in the Docker image (`.dockerignore` excludes `*.ipynb`).
+
+## Data prerequisites (the #1 startup failure)
+
+- `./eprints_vector_db` is gitignored and required at startup. If absent, the app fails to boot (`RuntimeError` in `backend.py`).
+- Ingest by running the notebook top to bottom: harvest OAI-PMH (`https://v.undip.ac.id/cgi/oai2`, `metadataPrefix=oai_dc`, target 1000 valid records) → writes `eprints_undip_clean.json` → embeds `"{title}. {description}"` and inserts into Chroma.
+- The notebook **deletes and recreates** collection `undip_research_search` with `{"hnsw:space": "cosine"}`. Re-running wipes existing vectors; there is no incremental update path.
+- Inserts are batched at 1000 because Chroma rejects larger batches (~5461 cap).
+- Notebook needs `sickle`, which is **not** in `requirements.txt` (installed via `%pip install` cell). Notebook also calls `%pip install sentence-transformers chromadb`.
+- Embedding model (`sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2`) downloads at startup. Docker sets `HF_HOME=/model-cache` backed by the named `model_cache` volume so restarts don't re-download; local runs use the default HF cache.
+- Ingestion and the app must use the same model, or stored vectors won't match query vectors.
+
+## Commands
+
+```bash
+pip install -r requirements.txt
+uvicorn backend:app --reload --port 8000   # local dev; run from repo root
+pip install -r requirements-dev.txt && pytest   # tests (no model download needed)
+cp .env.example .env                       # then fill GEMINI_API_KEY and GEMINI_MODEL
+docker compose up --build                  # serves backend.py on :8000 (needs .env)
+```
+
+- Run uvicorn from the repo root: `DB_PATH = "./eprints_vector_db"` is relative to the CWD.
+- `pytest` is the only configured tool (`pytest.ini`, tests in `tests/`). No linter, formatter, or typechecker is configured; verify before assuming `ruff` etc. exist.
+- LLM: Google Gemini via `google-genai`, configured by env `GEMINI_API_KEY` and `GEMINI_MODEL`. Never commit `.env` (it is gitignored). If either is empty the API still works and returns the list only (`status=list_only`). No automatic retry: failures surface in `ringkasan_error` and the user retries manually.
+- `requirements.txt` is range-pinned (`chromadb>=1.5,<2`, `sentence-transformers>=6,<7`); code depends on Chroma 1.x APIs. `docker-compose.yml` bind-mounts `./eprints_vector_db`, so the host DB is what the container reads.
+
+## API contract
+
+- `POST /search`. Request `{query: str, min_length=1 (whitespace is stripped), threshold: float = 0.5, THRESHOLD_MIN <= threshold <= THRESHOLD_MAX}`.
+- `threshold` is a **minimum similarity** (`1 - cosine distance`); higher = stricter (matches the UI slider). Bounds are constants in `backend.py` (initial values 0.1 / 0.9, tune on real data).
+- Response `{query, threshold, count, results, status, ringkasan, ringkasan_error, arahan}`. `status` is `full` (AI summary + list), `list_only` (LLM failed or not configured; reason in `ringkasan_error`) or `no_results` (nothing passed the threshold; practical hints in `arahan`). Citations in `ringkasan` are `[n]` where n = `peringkat`; invalid numbers are stripped.
+- Each result has **Indonesian keys**: `peringkat`, `skor`, `judul`, `penulis`, `deskripsi`, `url`, `date`. `skor` is a similarity (higher = closer), and `peringkat` is a dense rank computed after filtering. Only the top `SUMMARY_TOP_K` results are sent to the LLM.
+- `GET /health` returns `{status, documents}`.
+- Always fetches `N_RESULTS = 100` then filters in Python. There is no pagination or `offset`.
+- Result construction indexes Chroma metadata directly (`metadata["title"]`, `["creators"]`, `["url"]`, `["description"]`, `["date"]`) — a missing metadata key raises `KeyError` per request. Metadata shape is owned by the ingestion notebook; change both together.
