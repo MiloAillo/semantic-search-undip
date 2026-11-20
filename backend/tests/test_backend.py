@@ -59,6 +59,8 @@ def make_client(distances, summarize=None, metadatas=None):
         {"query": "   "},
         {"query": "kemiskinan", "threshold": backend.THRESHOLD_MAX + 0.01},
         {"query": "kemiskinan", "threshold": backend.THRESHOLD_MIN - 0.01},
+        {"query": "kemiskinan", "max_threshold": backend.THRESHOLD_MAX + 0.01},
+        {"query": "kemiskinan", "max_threshold": backend.THRESHOLD_MIN - 0.01},
         {},
     ],
 )
@@ -112,6 +114,22 @@ def test_threshold_bawaan_menolak_skor_di_bawahnya():
     assert body["status"] == "no_results"
 
 
+def test_max_threshold_diterima_sebagai_alias_kemiripan():
+    # Frontend AISEn masih mengirim `max_threshold` (0.4/0.5/0.6).
+    # Nilainya kemiripan minimum, sama seperti `threshold`.
+    body = make_client([0.1, 0.5]).post(
+        "/search", json={"query": "x", "max_threshold": 0.6}
+    ).json()
+    assert body["threshold"] == 0.6
+    assert body["count"] == 1  # 0.9 lolos, 0.5 tidak
+
+
+def test_respons_memuat_nama_lama_dan_baru():
+    body = make_client([0.1]).post("/search", json={"query": "x"}).json()
+    assert body["threshold"] == backend.THRESHOLD_DEFAULT
+    assert body["max_threshold"] == body["threshold"]  # alias lama, selalu sinkron
+
+
 def test_no_results_menyebut_skor_tertinggi():
     # jarak 0.9 -> kemiripan 0.099...; threshold 0.5 tidak meloloskan apa pun.
     body = make_client([0.9]).post(
@@ -145,7 +163,7 @@ def test_db_kosong_tidak_menyarankan_turunkan_threshold():
 
 
 def test_metadata_tidak_lengkap_tidak_menyebabkan_error():
-    # Metadata notebook bisa berubah/bolong; respons harus tetap 200.
+    # Metadata dari ingest.py bisa berubah/bolong; respons harus tetap 200.
     body = make_client(
         [0.1], metadatas=[{"title": "Hanya judul"}]
     ).post("/search", json={"query": "x"}).json()
@@ -307,6 +325,22 @@ def test_llm_sukses_dan_sitasi_tidak_valid_dibuang(monkeypatch):
     out = backend.summarize_with_llm("x", _hasil(2))
     assert "[1]" in out and "[2]" in out
     assert "[7]" not in out
+
+
+def test_sitasi_gabungan_dipecah_jadi_satu_per_satu():
+    # Model kadang tetap menulis [1, 2, 3]; UI butuh [1] [2] [3].
+    out = backend.sanitize_citations("A [1, 2, 3]. B [7].", {1, 2, 3})
+    assert "[1] [2] [3]" in out
+    assert "[7]" not in out
+    assert "[1, 2, 3]" not in out
+
+
+def test_prompt_memuat_instruksi_sitasi_dan_sumber():
+    prompt = backend.build_prompt("kemiskinan", _hasil(2))
+    assert "kemiskinan" in prompt
+    assert "[1]" in prompt and "[2]" in prompt
+    assert "180 kata" in prompt
+    assert "jangan digabung" in prompt
 
 
 # ---------- lain-lain ----------

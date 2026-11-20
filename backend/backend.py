@@ -9,7 +9,7 @@ from typing import Literal
 import chromadb
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, computed_field
 from starlette.concurrency import run_in_threadpool
 
 MODEL_NAME = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
@@ -18,8 +18,9 @@ COLLECTION_NAME = "undip_research_search"
 N_RESULTS = 100
 
 # Threshold = kemiripan minimum (1 - jarak cosine). Makin tinggi = makin ketat.
-# Batas bawah/atas slider UI. Nilai bawaan diukur dengan calibrate_threshold.py
-# pada 1.000 dokumen asli (eprints2): query relevan 0.58-0.73, noise <= 0.46.
+# Batas bawah/atas slider UI. Nilai bawaan diukur manual pada 1.000 dokumen
+# asli (eprints2): query relevan 0.58-0.73, noise <= 0.46. Lihat README
+# ("Why the default is 0.53") untuk tabel pengukurannya.
 THRESHOLD_MIN = 0.1
 THRESHOLD_MAX = 0.9
 THRESHOLD_DEFAULT = 0.53
@@ -140,12 +141,17 @@ class SearchRequest(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
 
     query: str = Field(..., min_length=1, description="Free-text search query (Indonesian or English).")
-    # BERUBAH: dulu `max_threshold` (jarak, makin kecil makin ketat).
+    # `max_threshold` adalah nama lama yang masih dipakai klien frontend.
+    # Nilainya SELALU kemiripan minimum (makin tinggi makin ketat), bukan jarak.
     threshold: float = Field(
         default=THRESHOLD_DEFAULT,
+        validation_alias=AliasChoices("threshold", "max_threshold"),
         ge=THRESHOLD_MIN,
         le=THRESHOLD_MAX,
-        description="Minimum similarity (1 - cosine distance). Higher = stricter.",
+        description=(
+            "Minimum similarity (1 - cosine distance). Higher = stricter. "
+            "`max_threshold` is accepted as a deprecated alias."
+        ),
     )
 
 
@@ -161,7 +167,8 @@ class SearchResult(BaseModel):
 
 class SearchResponse(BaseModel):
     query: str
-    threshold: float  # BERUBAH: dulu `max_threshold`
+    # `threshold` tetap nama kanonis untuk klien baru.
+    threshold: float
     count: int
     results: list[SearchResult]
     # Field tambahan:
@@ -176,6 +183,13 @@ class SearchResponse(BaseModel):
     skor_tertinggi: float | None = None
     arahan: list[str] = Field(default_factory=list)
 
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def max_threshold(self) -> float:
+        """Alias lama untuk `threshold` (dipakai frontend). Akan dihapus
+        setelah klien pindah ke `threshold`; nilainya selalu sama."""
+        return self.threshold
+
 
 # ---- LLM (Google Gemini API) -----------------------------------------------
 class LLMError(Exception):
@@ -185,24 +199,39 @@ class LLMError(Exception):
 def build_prompt(query: str, results: list[SearchResult]) -> str:
     sources = "\n\n".join(f"[{r.peringkat}] {r.judul}\n{r.deskripsi}" for r in results)
     return (
-        "Jawab pertanyaan berdasarkan HANYA sumber di bawah ini. "
-        "Setiap klaim wajib diberi sitasi berformat [n] sesuai nomor sumber. "
-        "Jika sumber tidak cukup, katakan demikian.\n\n"
-        f"Pertanyaan: {query}\n\nSumber:\n{sources}"
+        "Anda adalah asisten riset. Tulis ringkasan singkat dalam bahasa Indonesia "
+        "tentang isi, temuan utama, atau pola yang muncul dari jurnal yang disajikan. "
+        "Gunakan HANYA sumber di bawah ini; jangan menambah fakta atau angka. "
+        "Panjang maksimal 3 paragraf dan 180 kata. Utamakan poin paling relevan, "
+        "hindari pengantar panjang dan jangan mengulang judul jurnal. "
+        "Setiap klaim faktual wajib memiliki sitasi [n] sesuai nomor sumber. "
+        "Tulis sitasi satu per satu, misalnya [1] [2] [3], jangan digabung "
+        "menjadi satu kurung seperti [1, 2, 3]. "
+        "Gunakan Markdown sederhana hanya untuk penekanan penting (**teks**) bila perlu. "
+        "Jika sumber tidak cukup, katakan secara singkat.\n\n"
+        f"Pertanyaan pengguna: {query}\n\nSumber jurnal:\n{sources}"
     )
 
 
-_CITATION = re.compile(r"\[(\d+)\]")
+_CITATION = re.compile(r"\[(\d+(?:\s*,\s*\d+)*)\]")
 
 
 def sanitize_citations(text: str, valid: set[int]) -> str:
-    """Buang sitasi [n] yang nomornya tidak ada di sumber yang dikirim ke LLM."""
+    """Buang sitasi [n] yang nomornya tidak ada di sumber yang dikirim ke LLM.
+
+    Sitasi gabungan seperti [1, 2, 3] dipecah menjadi [1] [2] [3] agar setiap
+    nomor bisa diklik satu per satu di UI.
+    """
 
     def keep(m: re.Match) -> str:
-        if int(m.group(1)) in valid:
-            return m.group(0)
-        log.warning("Sitasi tidak valid dibuang: %s", m.group(0))
-        return ""
+        nomor = [int(n) for n in m.group(1).split(",")]
+        dipakai = [n for n in nomor if n in valid]
+
+        for n in nomor:
+            if n not in valid:
+                log.warning("Sitasi tidak valid dibuang: [%s]", n)
+
+        return " ".join(f"[{n}]" for n in dipakai)
 
     return _CITATION.sub(keep, text)
 
@@ -262,7 +291,7 @@ def health() -> dict:
 def metadata_text(metadata: dict, key: str) -> str:
     """Ambil metadata dengan aman.
 
-    Bentuk metadata dimiliki notebook ingestion. Kalau satu dokumen saja
+    Bentuk metadata dimiliki `ingest.py`. Kalau satu dokumen saja
     kehilangan key (atau tipenya bukan string), jangan sampai seluruh
     pencarian jadi 500.
     """
@@ -331,7 +360,7 @@ async def search(payload: SearchRequest) -> SearchResponse:
             # threshold, itu menyesatkan.
             arahan = [
                 "Belum ada dokumen terindeks di basis data.",
-                "Jalankan notebook data_harvesting untuk mengisi basis data.",
+                "Jalankan python ingest.py --all untuk mengisi basis data.",
             ]
     else:
         try:
