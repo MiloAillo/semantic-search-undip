@@ -1,12 +1,11 @@
 # Data Pipeline
 
 How the vector database gets built, and the contract the service depends on.
-Everything here happens in `data_harvesting.ipynb` — there is no other ingestion
-path.
+Everything here happens in `ingest.py` — there is no other ingestion path.
 
 > The app reads `./eprints_vector_db` and refuses to start without it. That
 > directory and `eprints_undip_clean.json` are git-ignored, so a fresh clone has
-> no data until you run the notebook.
+> no data until you run `python ingest.py --all`.
 
 ## Pipeline overview
 
@@ -65,7 +64,7 @@ of the OAI feed, not a random or complete sample of Undip's repository.
 | Insert batch | 1,000 (Chroma rejects batches above ~5,461) |
 | Document IDs | `doc_0`, `doc_1`, … |
 
-**The notebook deletes the collection first**, then recreates it. Re-running it
+**`ingest.py` deletes the collection first**, then recreates it. Re-running it
 wipes every vector; there is no incremental update path. Stop the API server
 before re-ingesting so it is not querying a collection that is being replaced.
 
@@ -74,7 +73,7 @@ title plus the opening of the abstract — not the whole document.
 
 ## Metadata contract
 
-The notebook owns the metadata shape; `backend.py` reads it. Change both together.
+`ingest.py` owns the metadata shape; `backend.py` reads it. Change both together.
 
 | Chroma metadata key | Source | Returned as | Notes |
 |---|---|---|---|
@@ -91,37 +90,38 @@ a similarity. `/health` reports the metric so this is checkable.
 ## Rebuilding from scratch
 
 1. Stop the API server.
-2. Run `data_harvesting.ipynb` top to bottom:
-   - cell 0 installs `sickle`, `sentence-transformers`, `chromadb`;
-   - cell 2 harvests to `eprints_undip_clean.json`;
-   - cell 3 deletes/recreates the collection and loads it;
-   - cell 4 is an interactive sanity check only. It applies the same
-     minimum-similarity rule as the API (`1 - distance >= 0.53`) and is not part
-     of ingestion.
+2. From `backend/`, run the whole pipeline:
+
+   ```bash
+   python ingest.py --all
+   ```
+
+   That harvests `eprints2` into `eprints_undip_clean.json`, then deletes and
+   recreates the Chroma collection. Use `--harvest` / `--index` to run one stage,
+   `--target N` to change the record count, and `--query "..."` for a
+   similarity check against the fresh index.
 3. Start the server, then confirm:
+
    ```bash
    curl http://localhost:8000/health
    # documents == number of harvested records, metric == "cosine"
    ```
-4. Calibrate the threshold against the new data:
-   ```bash
-   python calibrate_threshold.py
-   ```
-   It suggests a value only when relevant and off-topic scores separate; if it
-   prints `TIDAK ADA AMBANG YANG MEMISAHKAN`, improve retrieval instead of
-   picking a number.
 
-`requirements.txt` does **not** include `sickle` — it is installed by the
-notebook's first cell and is only needed for harvesting.
+4. Re-check the threshold on the new data with `python ingest.py --query "<phrase>"`
+   (see the measured table in the README). If relevant and off-topic scores no
+   longer separate, fix retrieval; do not invent a threshold.
+
+`sickle` is part of `requirements.txt`, so `pip install -r requirements.txt`
+covers harvesting as well as serving.
 
 ## Reproducibility notes
 
 - The harvested JSON and the vector DB are both git-ignored. Rebuilding requires
   network access to the Undip OAI endpoint, which is outside this repository's
   control.
-- The notebook was executed on Python 3.14 while the service runs on Python 3.11
-  (Docker). This does not change the vectors, but it means the notebook was not
-  validated against the runtime interpreter.
+- `ingest.py` imports `MODEL_NAME`, `DB_PATH`, `COLLECTION_NAME`, and
+  `THRESHOLD_DEFAULT` from `backend.py`, so ingestion and serving cannot drift
+  onto different models, paths, or defaults.
 - The embedding model is referenced by name, not by revision. An upstream model
   update would silently produce vectors that no longer match queries.
 
@@ -129,13 +129,13 @@ notebook's first cell and is only needed for harvesting.
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `ModuleNotFoundError: sickle` | Notebook cell 0 not run | Run it, or `pip install sickle` |
-| Harvest prints an exception and stops | OAI endpoint unreachable or rate-limited | Retry later; check the endpoint in a browser |
-| Fewer than 1,000 records saved | The OAI stream ended early, or the loop hit an exception | Read the printed error and re-run; the count is not a filter problem |
-| `eprints_undip_clean.json` missing after an error | The whole harvest is wrapped in a broad `try/except` | Re-run the cell; the file is only written on success |
+| `ModuleNotFoundError: sickle` | Dependencies not installed | `pip install -r requirements.txt` |
+| Harvest logs an exception and stops | OAI endpoint unreachable or rate-limited | Retry later; check the endpoint in a browser |
+| Fewer than 1,000 records saved | The OAI stream ended early | Read the log and re-run; the count is not a filter problem |
+| `eprints_undip_clean.json` missing after an error | `json.dump` only runs after a successful harvest loop | Re-run `python ingest.py --harvest` |
 | Chroma rejects an insert batch | Batch over the ~5,461 cap | Keep the 1,000-record batching |
-| `documents: 0` in `/health` after ingest | Wrong `DB_PATH` (relative to CWD) | Run the notebook and the server from `backend/` |
-| Search results look random | Collection not built with `hnsw:space=cosine` | Recreate the collection (cell 3) |
+| `documents: 0` in `/health` after ingest | Wrong `DB_PATH` (relative to CWD) | Run `ingest.py` and the server from `backend/` |
+| Search results look random | Collection not built with `hnsw:space=cosine` | Recreate it with `python ingest.py --index` |
 | Docker sees no data | `./eprints_vector_db` missing on the host | Build it on the host; compose bind-mounts it |
 | Container exits with `attempt to write a readonly database` | The bind-mounted DB is owned by your UID, the image runs as a different UID | Build with `APP_UID=$(id -u) docker compose up -d --build`; `chmod -R a+rwX eprints_vector_db` is a stopgap |
 | `APP_UID` changed but the container still fails | The `model_cache` volume is owned by the previous UID | `docker compose down -v`, then rebuild |

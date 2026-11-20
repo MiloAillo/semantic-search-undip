@@ -34,15 +34,14 @@ when something does not cooperate. Written for the prototype as it exists today.
   ```
   Expect `"documents": 1000` (or whatever your harvest produced),
   `"llm_configured": true`, `"metric": "cosine"`.
-- [ ] Calibrate the threshold:
+- [ ] Sanity-check the relevance gate (there is no separate calibration script):
   ```bash
-  python calibrate_threshold.py
+  python ingest.py --query "analisis kualitas air sungai"
   ```
-  It scores a relevant set and an off-topic set. If the bands separate it prints
-  a `THRESHOLD_DEFAULT`; paste it into `backend.py`, restart, and confirm a normal
-  query returns `"status": "full"`. If it prints `TIDAK ADA AMBANG YANG
-  MEMISAHKAN`, do not invent a number — the retrieval is the problem.
-- [ ] Run one full query end to end **after** that change. A response with
+  Expect results around 0.66. Then try an off-topic phrase such as
+  `resep rendang padang`; it should score about 0.46. If relevant and off-topic
+  scores overlap, fix retrieval rather than changing `THRESHOLD_DEFAULT`.
+- [ ] Run one full query end to end. A response with
   `"status": "full"` and a non-empty `ringkasan` is the only proof that the LLM
   path works.
 - [ ] Take a screenshot of a successful `full` response.
@@ -109,9 +108,8 @@ Answers that are honest and short. Do not overclaim.
   chunk or summarize first.
 - **Why is the threshold 0.53?** Measured on this corpus: relevant phrases put
   the best hit at 0.58–0.73, while off-topic queries top out at 0.46. `0.53` is
-  the midpoint of that gap, so it keeps real matches and rejects noise.
-  `calibrate_threshold.py` reproduces the numbers and refuses to suggest a value
-  if the two bands overlap.
+  the midpoint of that gap, so it keeps real matches and rejects noise. You can
+  reproduce the scores with `python ingest.py --query "<phrase>"`.
 - **Why did "stunting" return nothing?** One word is too vague: it scores 0.47,
   just under the bar. Ask for `faktor risiko stunting pada balita` (0.65). An
   empty result is the intended behaviour when the corpus has nothing clear —

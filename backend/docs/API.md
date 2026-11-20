@@ -25,8 +25,8 @@ skor = round(1 - cosine_distance, 6)
 ```
 
 Higher `skor` means closer. `threshold` is a **minimum** similarity — the opposite
-of the distance semantics used in the ingestion notebook and in the first version
-of this API.
+of the distance semantics used in the first version of this API (and in the
+retired ingestion notebook).
 
 | distance | skor | passes `threshold: 0.5`? |
 |---|---|---|
@@ -61,7 +61,8 @@ verbatim throughout this document:
 | Field | Type | Required | Constraints | Notes |
 |---|---|---|---|---|
 | `query` | string | yes | at least 1 character **after** trimming | Leading/trailing whitespace is stripped, so `"   "` is rejected. No maximum length. Indonesian and English both work. |
-| `threshold` | number | no | `0.1 ≤ threshold ≤ 0.9` | Default `0.53`. Minimum similarity; higher is stricter. Bounds are `THRESHOLD_MIN` / `THRESHOLD_MAX` / `THRESHOLD_DEFAULT` in `backend.py:22-24`. The default is measured on the shipped corpus; see [Calibrating the threshold](../README.md#calibrating-the-threshold). |
+| `threshold` | number | no | `0.1 ≤ threshold ≤ 0.9` | Default `0.53`. Minimum similarity; higher is stricter. Bounds are `THRESHOLD_MIN` / `THRESHOLD_MAX` / `THRESHOLD_DEFAULT` in `backend.py`. The default is measured on the shipped corpus; see [Why the default is 0.53](../README.md#why-the-default-is-053). |
+| `max_threshold` | number | no | same as `threshold` | **Deprecated alias** kept for the existing frontend. Same minimum-similarity scale, not a distance. If both are sent, `threshold` wins. |
 
 There is no `offset`, `page`, or `limit` parameter.
 
@@ -79,6 +80,7 @@ Always `200 OK` for a valid request — LLM failures do not produce error status
 |---|---|---|
 | `query` | string | Echo of the trimmed request query |
 | `threshold` | number | Echo of the applied threshold |
+| `max_threshold` | number | Deprecated alias of `threshold`; always equal. Remove once the frontend migrates. |
 | `count` | integer | `len(results)`, always |
 | `results` | array | Matching papers, best first; may be empty |
 | `status` | enum | `full`, `list_only`, or `no_results` |
@@ -126,6 +128,7 @@ summary did not.
 {
   "query": "faktor risiko stunting balita",
   "threshold": 0.53,
+  "max_threshold": 0.53,
   "count": 2,
   "results": [
     {
@@ -165,6 +168,7 @@ Any `[n]` outside that range is stripped from the summary before it is returned.
 {
   "query": "stunting",
   "threshold": 0.53,
+  "max_threshold": 0.53,
   "count": 2,
   "results": [
     {
@@ -214,6 +218,7 @@ There is no automatic retry. The client decides whether to retry.
 {
   "query": "stunting",
   "threshold": 0.53,
+  "max_threshold": 0.53,
   "count": 0,
   "results": [],
   "status": "no_results",
@@ -241,6 +246,7 @@ when the corpus has nothing relevant.
 {
   "query": "stunting",
   "threshold": 0.53,
+  "max_threshold": 0.53,
   "count": 0,
   "results": [],
   "status": "no_results",
@@ -249,7 +255,7 @@ when the corpus has nothing relevant.
   "skor_tertinggi": null,
   "arahan": [
     "Belum ada dokumen terindeks di basis data.",
-    "Jalankan notebook data_harvesting untuk mengisi basis data."
+    "Jalankan python ingest.py --all untuk mengisi basis data."
   ]
 }
 ```
@@ -383,14 +389,18 @@ Useful for frontend clients written against an earlier build.
 | Change | Before | After |
 |---|---|---|
 | Threshold semantics | `max_threshold` — maximum cosine **distance**, `0.0–2.0`, lower = stricter | `threshold` — minimum **similarity**, `0.1–0.9`, higher = stricter |
+| Legacy field name | — | `max_threshold` is accepted again as a deprecated **similarity** alias, and mirrored in every response so older clients keep working |
 | Score semantics | `skor` = distance, lower = better | `skor` = similarity, higher = better |
 | Response shape | `{query, max_threshold, count, results}` | adds `status`, `ringkasan`, `ringkasan_error`, `skor_tertinggi`, `arahan` |
 | AI summary | none | optional, `status` reflects whether it was produced |
+| Summary prompt | terse; no length or structure limit | capped at 3 paragraphs / 180 words, forbids invented facts and repeated titles |
+| Citations | `[1, 2, 3]` left as-is | split into `[1] [2] [3]`; invalid numbers removed |
 | `/health` | `{status, documents}` | adds `llm_configured`, `metric` |
 | Metadata handling | direct indexing, `KeyError` possible | missing fields become `""` |
 | LLM timeout | 20 s → 8 s | 15 s (measured: real calls run 1–7 s with a tail past 8 s) |
 | Default threshold | `0.5` (a guess) | `0.53` (measured midpoint: noise ≤ 0.46, relevant phrases ≥ 0.58) |
 | `no_results` guidance | "Kemiripan tertinggi …; turunkan threshold di bawah nilai itu." | reports the threshold and best score, no instruction to lower it — an empty result is valid |
+| Ingestion | notebook run by hand | `python ingest.py --all` (same harvest, JSON, and Chroma build) |
 
 See [DEMO.md](DEMO.md) for the operational checklist and [DATA.md](DATA.md) for
 how the collection must be built for these scores to mean anything.

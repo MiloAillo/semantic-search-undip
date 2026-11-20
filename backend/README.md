@@ -54,6 +54,7 @@ The service never fails a search because the LLM failed: the worst case is
 ```bash
 cp .env.example .env                      # fill in both Gemini values
 pip install -r requirements.txt
+python ingest.py --all                    # only if eprints_vector_db/ is missing
 uvicorn backend:app --reload --port 8000 --env-file .env
 ```
 
@@ -120,28 +121,20 @@ Full contract — every field, every status, every error, and the
 distance-vs-similarity rule that trips everyone up — is in
 [docs/API.md](docs/API.md).
 
-## Calibrating the threshold
+The frontend still sends the older field name `max_threshold`. It is accepted as
+an alias for `threshold` (same **minimum similarity** scale) and mirrored in the
+response, so both names always agree.
+
+## Why the default is 0.53
 
 `threshold` is a **minimum similarity**, not a distance: higher means stricter.
 It is a relevance gate, not a knob for "make sure something comes back". An
 empty result is a valid answer.
 
-The default (`0.53`, `backend.py:24`) was measured on the 1,000-record
-collection, not guessed. To re-measure after changing the corpus, the model, or
-the ingestion code:
-
-```bash
-python calibrate_threshold.py                  # built-in query sets
-python calibrate_threshold.py "query satu"     # your own relevant queries
-```
-
-The script scores two sets — queries that should match (`RELEVANT_QUERIES`) and
-off-topic queries that should not (`NOISE_QUERIES`) — and prints the top-5
-scores plus how many documents pass at the current default. It suggests a value
-**only if the two score bands are separated** (midpoint between the strongest
-noise score and the weakest relevant score). If they overlap, it prints
-`TIDAK ADA AMBANG YANG MEMISAHKAN` and refuses to suggest a number: at that
-point the retrieval is wrong, not the threshold.
+The default (`0.53`, `THRESHOLD_DEFAULT` in `backend.py`) was measured on the 1,000-record
+collection, not guessed. The method: score a set of phrasal queries that should
+match and a set of off-topic queries that should not, then take the midpoint
+**only if the two bands separate**. On the shipped corpus they do.
 
 Measured on the 1,000-record collection with the real model:
 
@@ -158,13 +151,18 @@ gap. Single-word queries fall below it on purpose: they are too vague to be
 called relevant. Ask for what you want in a phrase instead of lowering the bar —
 and accept an empty list when the corpus genuinely has nothing.
 
+If you change the corpus, the model, or the ingestion code, re-measure before
+trusting the constant: run `python ingest.py --query "<phrase>"` for a few
+relevant and off-topic phrases and compare the reported similarities. If the
+bands overlap, fix retrieval rather than inventing a threshold.
+
 ## Project structure
 
 ```
 backend.py                 the entire service: lifespan, schemas, /search, /health, Gemini
-data_harvesting.ipynb      the only ingestion path: OAI-PMH -> JSON -> embeddings -> Chroma
-calibrate_threshold.py     prints real similarity scores and suggests a threshold default
-tests/test_backend.py      pytest suite; fake model and fake collection, no downloads
+ingest.py                  the only ingestion path: OAI-PMH -> JSON -> embeddings -> Chroma
+tests/test_backend.py      API tests; fake model and fake collection, no downloads
+tests/test_ingest.py       ingestion tests; fake records, model, and Chroma client
 docs/API.md                API reference
 docs/DATA.md               ingestion pipeline and metadata contract
 docs/DEMO.md               pre-meeting checklist and demo runbook
@@ -179,22 +177,22 @@ docker-compose.yml         single service + model cache volume
 | `RuntimeError: ChromaDB collection 'undip_research_search' was not found` | Database missing, or uvicorn started from the wrong directory | Build the DB ([docs/DATA.md](docs/DATA.md)) and run from `backend/` |
 | Startup hangs at "Waiting for application startup" with no further output | The repo sits on a network path (`\\wsl.localhost\...`, a share); SQLite blocks on it | Run uvicorn inside WSL, or copy the repo and the DB to a local disk |
 | Startup takes minutes | First-time embedding-model download (~470 MB) | Wait once; the HuggingFace cache (or `model_cache` volume) is reused |
-| `/health` shows `"documents": 0` | Empty collection | Run the ingestion notebook |
+| `/health` shows `"documents": 0` | Empty collection | Run `python ingest.py --all` |
 | `docker compose up` fails with `attempt to write a readonly database` | Bind-mounted DB owned by your UID; the image runs as a different UID | Build with `APP_UID=$(id -u) docker compose up -d --build`, or `chmod -R a+rwX eprints_vector_db` as a stopgap |
-| `/health` shows `"metric": null` or something other than `cosine` | Collection built without `hnsw:space=cosine` | Rebuild the collection with the notebook; scores are meaningless otherwise |
+| `/health` shows `"metric": null` or something other than `cosine` | Collection built without `hnsw:space=cosine` | Rebuild the collection with `python ingest.py --index`; scores are meaningless otherwise |
 | `status=list_only`, message "belum dikonfigurasi" | Gemini variables empty — often uvicorn started without `--env-file .env` | Set them, restart with `--env-file .env` |
 | `status=list_only`, message about quota | Gemini 429 / rate limit | Wait, or raise the quota |
 | `status=list_only`, message "Model LLM '...' tidak ditemukan" | Wrong `GEMINI_MODEL` | Use a currently available model name |
 | `status=list_only`, message "tidak merespons tepat waktu" | Gemini was slower than 15 s | Retry; if it happens often, check quota and network |
 | `status=no_results` on a one-word query | Short queries score below the default (0.47 vs 0.58–0.73 for phrases) | Ask in a phrase with more context; do not lower the threshold just to fill the list |
-| `status=no_results` every time | Threshold too strict | Run `calibrate_threshold.py` |
-| `status=no_results`, `arahan` says "Belum ada dokumen" | Collection is empty | Run the ingestion notebook |
+| `status=no_results` every time | Threshold too strict, or the corpus genuinely has no match | Score a phrase with `python ingest.py --query "<phrase>"`; if nothing is close, the retrieval is the problem, not the threshold |
+| `status=no_results`, `arahan` says "Belum ada dokumen" | Collection is empty | Run `python ingest.py --all` |
 | `422 Unprocessable Content` | Empty/whitespace `query`, or `threshold` outside 0.1–0.9 | Fix the request body |
 | Browser CORS error | Should not happen (`allow_origins=["*"]`) | Confirm the response carries `access-control-allow-origin: *` |
 
 ## Known limitations
 
-- **Sample, not corpus.** The notebook stops at the first 1,000 valid records in
+- **Sample, not corpus.** `ingest.py` stops at the first 1,000 valid records in
   OAI order (5,035 records scanned on the live feed), so the indexed set is an
   early-page sample rather than a random one.
 - **Truncated abstracts.** The embedding model truncates at 128 tokens, so
@@ -203,18 +201,18 @@ docker-compose.yml         single service + model cache volume
 - **Top 100 only.** The service always fetches 100 candidates and filters them in
   Python; there is no pagination or `offset`.
 - **Threshold measured on one sample.** `0.53` separates relevant from off-topic
-  on this 1,000-record sample; re-run `calibrate_threshold.py` on a different
-  corpus. See [Calibrating the threshold](#calibrating-the-threshold).
+  on this 1,000-record sample; re-measure on a different corpus. See
+  [Why the default is 0.53](#why-the-default-is-053).
 - **No authentication or rate limiting.** Anyone who can reach the port can spend
   Gemini quota.
-- **No incremental ingestion.** Re-running the notebook deletes and recreates the
-  collection.
+- **No incremental ingestion.** Re-running `ingest.py --index` deletes and
+  recreates the collection.
 - **One process, one worker.** The model is loaded once per process.
 - **No CI, linter, or lockfile.** Dependencies are range-pinned only.
 
 ## Data source and credits
 
-Paper metadata comes from the Universitas Diponegoro eprints2repository via
+Paper metadata comes from the Universitas Diponegoro eprints2 repository via
 OAI-PMH (`https://eprints2.undip.ac.id/cgi/oai2`, `metadataPrefix=oai_dc`). Embeddings
 use
 [`sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2`](https://huggingface.co/sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2).
