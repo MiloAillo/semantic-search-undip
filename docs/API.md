@@ -61,14 +61,14 @@ verbatim throughout this document:
 | Field | Type | Required | Constraints | Notes |
 |---|---|---|---|---|
 | `query` | string | yes | at least 1 character **after** trimming | Leading/trailing whitespace is stripped, so `"   "` is rejected. No maximum length. Indonesian and English both work. |
-| `threshold` | number | no | `0.1 ≤ threshold ≤ 0.9` | Default `0.5`. Minimum similarity; higher is stricter. Bounds are `THRESHOLD_MIN` / `THRESHOLD_MAX` / `THRESHOLD_DEFAULT` in `backend.py:22-24`. |
+| `threshold` | number | no | `0.1 ≤ threshold ≤ 0.9` | Default `0.53`. Minimum similarity; higher is stricter. Bounds are `THRESHOLD_MIN` / `THRESHOLD_MAX` / `THRESHOLD_DEFAULT` in `backend.py:22-24`. The default is measured on the shipped corpus; see [Calibrating the threshold](../README.md#calibrating-the-threshold). |
 
 There is no `offset`, `page`, or `limit` parameter.
 
 ```bash
 curl -X POST http://localhost:8000/search \
   -H "Content-Type: application/json" \
-  -d '{"query": "faktor risiko stunting balita", "threshold": 0.5}'
+  -d '{"query": "faktor risiko stunting balita", "threshold": 0.53}'
 ```
 
 ### Response body
@@ -85,7 +85,7 @@ Always `200 OK` for a valid request — LLM failures do not produce error status
 | `ringkasan` | string \| null | AI summary with `[n]` citations; `null` unless `status` is `full` |
 | `ringkasan_error` | string \| null | User-facing reason the summary is missing; `null` unless `status` is `list_only` |
 | `skor_tertinggi` | number \| null | Best similarity found when nothing passed the threshold; `null` otherwise (and `null` when the collection is empty) |
-| `arahan` | array of string | Practical guidance; non-empty only for `no_results` |
+| `arahan` | array of string | For `no_results`: the threshold applied, the best similarity found, and generic suggestions. It never tells the user to lower the threshold. |
 
 Every key is always present. `null` and `[]` are meaningful — see the status
 matrix.
@@ -110,8 +110,12 @@ Missing metadata never raises an error: absent fields are returned as `""`.
 |---|---|---|---|---|---|
 | `full` | ≥ 1 | summary text | `null` | `null` | `[]` |
 | `list_only` | ≥ 1 | `null` | error reason | `null` | `[]` |
-| `no_results` (nothing passed) | `[]` | `null` | `null` | best score | threshold hint + generic hints |
+| `no_results` (nothing passed) | `[]` | `null` | `null` | best score | threshold + best score + generic hints |
 | `no_results` (empty DB) | `[]` | `null` | `null` | `null` | "nothing indexed" hints |
+
+`no_results` is a legitimate outcome, not a failure: the corpus has nothing above
+the relevance bar the client asked for. Do not treat it as an error and do not
+lower the threshold just to fill the list.
 
 `list_only` is a graceful degradation, not an error: the search succeeded, the
 summary did not.
@@ -121,7 +125,7 @@ summary did not.
 ```json
 {
   "query": "faktor risiko stunting balita",
-  "threshold": 0.5,
+  "threshold": 0.53,
   "count": 2,
   "results": [
     {
@@ -160,7 +164,7 @@ Any `[n]` outside that range is stripped from the summary before it is returned.
 ```json
 {
   "query": "stunting",
-  "threshold": 0.5,
+  "threshold": 0.53,
   "count": 2,
   "results": [
     {
@@ -204,34 +208,39 @@ Possible `ringkasan_error` values (user-facing, Indonesian):
 
 There is no automatic retry. The client decides whether to retry.
 
-### Example: `no_results` (threshold too strict)
+### Example: `no_results` (nothing above the threshold)
 
 ```json
 {
   "query": "stunting",
-  "threshold": 0.5,
+  "threshold": 0.53,
   "count": 0,
   "results": [],
   "status": "no_results",
   "ringkasan": null,
   "ringkasan_error": null,
-  "skor_tertinggi": 0.38,
+  "skor_tertinggi": 0.4716,
   "arahan": [
-    "Kemiripan tertinggi yang ditemukan 0.38; turunkan threshold di bawah nilai itu.",
-    "Coba kata kunci lain.",
+    "Tidak ada jurnal yang mencapai ambang kemiripan 0.53.",
+    "Kemiripan tertinggi yang ditemukan: 0.47.",
+    "Coba kata kunci yang lebih spesifik.",
     "Perluas topik pencarian."
   ]
 }
 ```
 
-`skor_tertinggi` lets a UI explain the miss without a second request.
+`skor_tertinggi` lets a UI explain the miss without a second request. The
+guidance is diagnostic: it reports why the list is empty and how far the best
+candidate was. It deliberately does not tell the user to lower the threshold,
+because the threshold is the relevance guarantee — an empty answer is correct
+when the corpus has nothing relevant.
 
 ### Example: `no_results` (empty collection)
 
 ```json
 {
   "query": "stunting",
-  "threshold": 0.5,
+  "threshold": 0.53,
   "count": 0,
   "results": [],
   "status": "no_results",
@@ -360,7 +369,7 @@ frontend may run on any port. Before publishing the service, replace
 | Results sent to the LLM | 5 | `SUMMARY_TOP_K = 5` |
 | LLM wait before fallback | 15 s | `LLM_TIMEOUT_SECONDS = 15` |
 | `query` minimum length | 1 character after trim | `SearchRequest` |
-| `threshold` range | 0.1 – 0.9, default 0.5 | `THRESHOLD_MIN/MAX/DEFAULT` |
+| `threshold` range | 0.1 - 0.9, default 0.53 | `THRESHOLD_MIN/MAX/DEFAULT` |
 | Cold start (first boot) | minutes | embedding-model download |
 | Warm start | seconds | model + DB load |
 | Typical search latency | dominated by the LLM; retrieval is tens of ms | — |
@@ -380,6 +389,8 @@ Useful for frontend clients written against an earlier build.
 | `/health` | `{status, documents}` | adds `llm_configured`, `metric` |
 | Metadata handling | direct indexing, `KeyError` possible | missing fields become `""` |
 | LLM timeout | 20 s → 8 s | 15 s (measured: real calls run 1–7 s with a tail past 8 s) |
+| Default threshold | `0.5` (a guess) | `0.53` (measured midpoint: noise ≤ 0.46, relevant phrases ≥ 0.58) |
+| `no_results` guidance | "Kemiripan tertinggi …; turunkan threshold di bawah nilai itu." | reports the threshold and best score, no instruction to lower it — an empty result is valid |
 
 See [DEMO.md](DEMO.md) for the operational checklist and [DATA.md](DATA.md) for
 how the collection must be built for these scores to mean anything.

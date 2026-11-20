@@ -72,7 +72,7 @@ curl http://localhost:8000/health
 
 curl -X POST http://localhost:8000/search \
   -H "Content-Type: application/json" \
-  -d '{"query": "faktor risiko stunting balita", "threshold": 0.5}'
+  -d '{"query": "faktor risiko stunting balita", "threshold": 0.53}'
 ```
 
 Interactive docs are served at `http://localhost:8000/docs`; the machine-readable
@@ -82,12 +82,18 @@ schema is at `/openapi.json`.
 
 ```bash
 cp .env.example .env   # docker compose fails without this file
-docker compose up --build
+APP_UID=$(id -u) docker compose up -d --build --wait
 ```
 
-The container runs as a non-root user and bind-mounts `./eprints_vector_db` from
-the host, so the database must exist before the first start. The embedding model
-is cached in the `model_cache` volume, so restarts do not re-download it.
+`APP_UID` makes the container run as your own user, so it can write the
+bind-mounted `./eprints_vector_db`; without it the app exits with
+`attempt to write a readonly database`. On PowerShell:
+`$env:APP_UID=1000; docker compose up -d --build --wait`. The command returns
+only once the container is healthy.
+
+The embedding model is cached in the `model_cache` volume, so restarts do not
+re-download it. After changing `APP_UID`, run `docker compose down -v` once:
+the old volume belongs to the previous UID.
 
 For a demo, running uvicorn directly is simpler and has fewer moving parts.
 
@@ -117,31 +123,40 @@ distance-vs-similarity rule that trips everyone up — is in
 ## Calibrating the threshold
 
 `threshold` is a **minimum similarity**, not a distance: higher means stricter.
-The default (`0.5`, `backend.py:24`) is a guess. If the real matches in your
-database score lower, every query returns `no_results`.
+It is a relevance gate, not a knob for "make sure something comes back". An
+empty result is a valid answer.
+
+The default (`0.53`, `backend.py:24`) was measured on the 1,000-record
+collection, not guessed. To re-measure after changing the corpus, the model, or
+the ingestion code:
 
 ```bash
-python calibrate_threshold.py                  # built-in sample queries
-python calibrate_threshold.py "query satu"     # or your own
+python calibrate_threshold.py                  # built-in query sets
+python calibrate_threshold.py "query satu"     # your own relevant queries
 ```
 
-It prints the top-5 scores per query plus the `THRESHOLD_DEFAULT` value to paste
-into `backend.py`. Run it once on the machine that holds the database; the first
-run also downloads the embedding model.
+The script scores two sets — queries that should match (`RELEVANT_QUERIES`) and
+off-topic queries that should not (`NOISE_QUERIES`) — and prints the top-5
+scores plus how many documents pass at the current default. It suggests a value
+**only if the two score bands are separated** (midpoint between the strongest
+noise score and the weakest relevant score). If they overlap, it prints
+`TIDAK ADA AMBANG YANG MEMISAHKAN` and refuses to suggest a number: at that
+point the retrieval is wrong, not the threshold.
 
 Measured on the 1,000-record collection with the real model:
 
 | Query shape | Best score |
 |---|---|
-| full phrase (`analisis kualitas air sungai`) | 0.68 |
-| full phrase (`penelitian tentang kemiskinan`) | 0.57 |
-| one word (`stunting`) | 0.49 |
-| off-topic (`resep rendang padang`) | 0.44 |
+| full phrase (`pengaruh media sosial terhadap perilaku remaja`) | 0.73 |
+| full phrase (`analisis kualitas air sungai`) | 0.66 |
+| shorter phrase (`energi terbarukan`) | 0.58 |
+| one word (`stunting`) | 0.47 |
+| off-topic (`resep rendang padang`) | 0.46 |
 
-The default `0.5` sits between "one word" and "off-topic": phrase queries pass,
-most single-word queries do not, and off-topic text is rejected. That margin is
-narrow, so re-run the calibration script if you change the model, the corpus, or
-the abstract truncation.
+Noise tops out at 0.46 and relevant phrases start at 0.58, so `0.53` sits in the
+gap. Single-word queries fall below it on purpose: they are too vague to be
+called relevant. Ask for what you want in a phrase instead of lowering the bar —
+and accept an empty list when the corpus genuinely has nothing.
 
 ## Project structure
 
@@ -165,13 +180,13 @@ docker-compose.yml         single service + model cache volume
 | Startup hangs at "Waiting for application startup" with no further output | The repo sits on a network path (`\\wsl.localhost\...`, a share); SQLite blocks on it | Run uvicorn inside WSL, or copy the repo and the DB to a local disk |
 | Startup takes minutes | First-time embedding-model download (~470 MB) | Wait once; the HuggingFace cache (or `model_cache` volume) is reused |
 | `/health` shows `"documents": 0` | Empty collection | Run the ingestion notebook |
-| `docker compose up` fails with `attempt to write a readonly database` | Bind-mounted DB owned by your UID; the image runs as UID 10001 | `chmod -R a+rwX eprints_vector_db`, then restart |
+| `docker compose up` fails with `attempt to write a readonly database` | Bind-mounted DB owned by your UID; the image runs as a different UID | Build with `APP_UID=$(id -u) docker compose up -d --build`, or `chmod -R a+rwX eprints_vector_db` as a stopgap |
 | `/health` shows `"metric": null` or something other than `cosine` | Collection built without `hnsw:space=cosine` | Rebuild the collection with the notebook; scores are meaningless otherwise |
 | `status=list_only`, message "belum dikonfigurasi" | Gemini variables empty — often uvicorn started without `--env-file .env` | Set them, restart with `--env-file .env` |
 | `status=list_only`, message about quota | Gemini 429 / rate limit | Wait, or raise the quota |
 | `status=list_only`, message "Model LLM '...' tidak ditemukan" | Wrong `GEMINI_MODEL` | Use a currently available model name |
 | `status=list_only`, message "tidak merespons tepat waktu" | Gemini was slower than 15 s | Retry; if it happens often, check quota and network |
-| `status=no_results` on a one-word query | Short queries score below the default (0.49 vs 0.59–0.68 for phrases) | Ask in a phrase, or lower `threshold` |
+| `status=no_results` on a one-word query | Short queries score below the default (0.47 vs 0.58–0.73 for phrases) | Ask in a phrase with more context; do not lower the threshold just to fill the list |
 | `status=no_results` every time | Threshold too strict | Run `calibrate_threshold.py` |
 | `status=no_results`, `arahan` says "Belum ada dokumen" | Collection is empty | Run the ingestion notebook |
 | `422 Unprocessable Content` | Empty/whitespace `query`, or `threshold` outside 0.1–0.9 | Fix the request body |
@@ -180,15 +195,16 @@ docker-compose.yml         single service + model cache volume
 ## Known limitations
 
 - **Sample, not corpus.** The notebook stops at the first 1,000 valid records in
-  OAI order (1,152 records scanned on the live feed), so the indexed set is an
+  OAI order (5,035 records scanned on the live feed), so the indexed set is an
   early-page sample rather than a random one.
 - **Truncated abstracts.** The embedding model truncates at 128 tokens, so
   stored vectors effectively represent the title plus the opening of the
   abstract.
 - **Top 100 only.** The service always fetches 100 candidates and filters them in
   Python; there is no pagination or `offset`.
-- **Uncalibrated default threshold.** See
-  [Calibrating the threshold](#calibrating-the-threshold).
+- **Threshold measured on one sample.** `0.53` separates relevant from off-topic
+  on this 1,000-record sample; re-run `calibrate_threshold.py` on a different
+  corpus. See [Calibrating the threshold](#calibrating-the-threshold).
 - **No authentication or rate limiting.** Anyone who can reach the port can spend
   Gemini quota.
 - **No incremental ingestion.** Re-running the notebook deletes and recreates the
@@ -198,8 +214,8 @@ docker-compose.yml         single service + model cache volume
 
 ## Data source and credits
 
-Paper metadata comes from the Universitas Diponegoro eprints repository via
-OAI-PMH (`https://eprints.undip.ac.id/cgi/oai2`, `metadataPrefix=oai_dc`). Embeddings
+Paper metadata comes from the Universitas Diponegoro eprints2repository via
+OAI-PMH (`https://eprints2.undip.ac.id/cgi/oai2`, `metadataPrefix=oai_dc`). Embeddings
 use
 [`sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2`](https://huggingface.co/sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2).
 Summaries are generated by Google Gemini.

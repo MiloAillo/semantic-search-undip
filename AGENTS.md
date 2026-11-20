@@ -10,7 +10,7 @@ One small service: FastAPI semantic search over harvested Universitas Diponegoro
 ## Data prerequisites (the #1 startup failure)
 
 - `./eprints_vector_db` is gitignored and required at startup. If absent, the app fails to boot (`RuntimeError` in `backend.py`).
-- Ingest by running the notebook top to bottom: harvest OAI-PMH (`https://eprints.undip.ac.id/cgi/oai2`, `metadataPrefix=oai_dc`, target 1000 valid records) → writes `eprints_undip_clean.json` → embeds `"{title}. {description}"` and inserts into Chroma.
+- Ingest by running the notebook top to bottom: harvest OAI-PMH (`https://eprints2.undip.ac.id/cgi/oai2`, `metadataPrefix=oai_dc`, target 1000 valid records) → writes `eprints_undip_clean.json` → embeds `"{title}. {description}"` and inserts into Chroma.
 - The notebook **deletes and recreates** collection `undip_research_search` with `{"hnsw:space": "cosine"}`. Re-running wipes existing vectors; there is no incremental update path.
 - Inserts are batched at 1000 because Chroma rejects larger batches (~5461 cap).
 - Notebook needs `sickle`, which is **not** in `requirements.txt` (installed via `%pip install` cell). Notebook also calls `%pip install sentence-transformers chromadb`.
@@ -25,19 +25,20 @@ uvicorn backend:app --reload --port 8000   # local dev; run from repo root
 pip install -r requirements-dev.txt && pytest   # tests (no model download needed)
 cp .env.example .env                       # then fill GEMINI_API_KEY and GEMINI_MODEL
 docker compose up --build                  # serves backend.py on :8000 (needs .env)
+APP_UID=$(id -u) docker compose up -d --build --wait   # same, writable bind mount, waits for health
 ```
 
 - Run uvicorn from the repo root: `DB_PATH = "./eprints_vector_db"` is relative to the CWD.
 - `pytest` is the only configured tool (`pytest.ini`, tests in `tests/`). No linter, formatter, or typechecker is configured; verify before assuming `ruff` etc. exist.
 - LLM: Google Gemini via `google-genai`, configured by env `GEMINI_API_KEY` and `GEMINI_MODEL`. Never commit `.env` (it is gitignored). If either is empty the API still works and returns the list only (`status=list_only`). No automatic retry: failures surface in `ringkasan_error` and the user retries manually.
-- `requirements.txt` is range-pinned (`chromadb>=1.5,<2`, `sentence-transformers>=6,<7`); code depends on Chroma 1.x APIs. `docker-compose.yml` bind-mounts `./eprints_vector_db`, so the host DB is what the container reads.
+- `requirements.txt` is range-pinned (`chromadb>=1.5,<2`, `sentence-transformers>=6,<7`); code depends on Chroma 1.x APIs. `docker-compose.yml` bind-mounts `./eprints_vector_db`, so the host DB is what the container reads; build with `APP_UID=$(id -u)` so the container can write it. LLM budget is `LLM_TIMEOUT_SECONDS = 15` (measured: real calls 1–7 s, tail past 8 s).
 
 ## API contract
 
-- `POST /search`. Request `{query: str, min_length=1 (whitespace is stripped), threshold: float = 0.5, THRESHOLD_MIN <= threshold <= THRESHOLD_MAX}`.
-- `threshold` is a **minimum similarity** (`1 - cosine distance`); higher = stricter (matches the UI slider). Bounds are constants in `backend.py` (initial values 0.1 / 0.9, tune on real data). `python calibrate_threshold.py` prints real top-5 scores for sample queries and suggests a `THRESHOLD_DEFAULT` — run it against the real DB before a demo, because 0.5 is only a guess.
-- Response `{query, threshold, count, results, status, ringkasan, ringkasan_error, skor_tertinggi, arahan}`. `status` is `full` (AI summary + list), `list_only` (LLM failed or not configured; reason in `ringkasan_error`) or `no_results` (nothing passed the threshold; `skor_tertinggi` is the best similarity found, `arahan` gives practical hints — the empty-DB case gets its own message). Citations in `ringkasan` are `[n]` where n = `peringkat`; invalid numbers are stripped.
+- `POST /search`. Request `{query: str, min_length=1 (whitespace is stripped), threshold: float = 0.53, THRESHOLD_MIN <= threshold <= THRESHOLD_MAX}`.
+- `threshold` is a **minimum similarity** (`1 - cosine distance`); higher = stricter (matches the UI slider). Bounds are constants in `backend.py` (0.1 / 0.9; the client may loosen or tighten inside that range). `THRESHOLD_DEFAULT = 0.53` is measured, not guessed: `python calibrate_threshold.py` scores a relevant set and a noise set on the real DB and suggests the midpoint only when the bands separate, refusing otherwise. Empty results are a valid answer — never recommend lowering the threshold just to fill the list.
+- Response `{query, threshold, count, results, status, ringkasan, ringkasan_error, skor_tertinggi, arahan}`. `status` is `full` (AI summary + list), `list_only` (LLM failed or not configured; reason in `ringkasan_error`) or `no_results` (nothing passed the threshold; `skor_tertinggi` is the best similarity found, and `arahan` states the threshold and that best score plus generic suggestions — it does not tell the user to lower the threshold; the empty-DB case gets its own message). Citations in `ringkasan` are `[n]` where n = `peringkat`; invalid numbers are stripped.
 - Each result has **Indonesian keys**: `peringkat`, `skor`, `judul`, `penulis`, `deskripsi`, `url`, `date`. `skor` is a similarity (higher = closer), and `peringkat` is a dense rank computed after filtering. Only the top `SUMMARY_TOP_K` results are sent to the LLM.
 - `GET /health` returns `{status, documents, llm_configured, metric}`. `metric` should be `cosine`; anything else means stored vectors were built without `hnsw:space=cosine` and `skor` is not a similarity.
 - Always fetches `N_RESULTS = 100` then filters in Python. There is no pagination or `offset`.
-- Result construction indexes Chroma metadata directly (`metadata["title"]`, `["creators"]`, `["url"]`, `["description"]`, `["date"]`) — a missing metadata key raises `KeyError` per request. Metadata shape is owned by the ingestion notebook; change both together.
+- Result construction reads Chroma metadata through `metadata_text()`, which tolerates a missing key or `metadata=None` and returns `""` (a warning is logged). The notebook still owns the metadata shape; change both together.

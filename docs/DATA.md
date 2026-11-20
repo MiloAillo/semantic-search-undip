@@ -11,7 +11,7 @@ path.
 ## Pipeline overview
 
 ```
-OAI-PMH (eprints.undip.ac.id/cgi/oai2)
+OAI-PMH (eprints2.undip.ac.id/cgi/oai2)
         │  harvest + filter
         ▼
 eprints_undip_clean.json          (~1,000 records)
@@ -24,11 +24,11 @@ eprints_vector_db/                 ChromaDB, collection "undip_research_search"
 
 | Setting | Value |
 |---|---|
-| Endpoint | `https://eprints.undip.ac.id/cgi/oai2` |
+| Endpoint | `https://eprints2.undip.ac.id/cgi/oai2` |
 | Metadata format | `oai_dc` |
 | Client | `sickle` |
 | Target | 1,000 valid records |
-| Observed | 1,000 kept out of 1,152 scanned |
+| Observed | 1,000 kept out of 5,035 scanned |
 
 A record is kept when **all** of these hold:
 
@@ -95,9 +95,9 @@ a similarity. `/health` reports the metric so this is checkable.
    - cell 0 installs `sickle`, `sentence-transformers`, `chromadb`;
    - cell 2 harvests to `eprints_undip_clean.json`;
    - cell 3 deletes/recreates the collection and loads it;
-   - cell 4 is an interactive sanity check only. It filters by **distance**
-     (`distance <= 0.5`), the opposite of the API's minimum-similarity threshold,
-     so do not copy its logic into a client.
+   - cell 4 is an interactive sanity check only. It applies the same
+     minimum-similarity rule as the API (`1 - distance >= 0.53`) and is not part
+     of ingestion.
 3. Start the server, then confirm:
    ```bash
    curl http://localhost:8000/health
@@ -107,6 +107,9 @@ a similarity. `/health` reports the metric so this is checkable.
    ```bash
    python calibrate_threshold.py
    ```
+   It suggests a value only when relevant and off-topic scores separate; if it
+   prints `TIDAK ADA AMBANG YANG MEMISAHKAN`, improve retrieval instead of
+   picking a number.
 
 `requirements.txt` does **not** include `sickle` — it is installed by the
 notebook's first cell and is only needed for harvesting.
@@ -134,4 +137,5 @@ notebook's first cell and is only needed for harvesting.
 | `documents: 0` in `/health` after ingest | Wrong `DB_PATH` (relative to CWD) | Run the notebook and the server from the repo root |
 | Search results look random | Collection not built with `hnsw:space=cosine` | Recreate the collection (cell 3) |
 | Docker sees no data | `./eprints_vector_db` missing on the host | Build it on the host; compose bind-mounts it |
-| Container exits with `attempt to write a readonly database` | The bind-mounted DB is owned by your UID, the image runs as UID 10001 | `chmod -R a+rwX eprints_vector_db` on the host |
+| Container exits with `attempt to write a readonly database` | The bind-mounted DB is owned by your UID, the image runs as a different UID | Build with `APP_UID=$(id -u) docker compose up -d --build`; `chmod -R a+rwX eprints_vector_db` is a stopgap |
+| `APP_UID` changed but the container still fails | The `model_cache` volume is owned by the previous UID | `docker compose down -v`, then rebuild |
