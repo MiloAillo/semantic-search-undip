@@ -61,7 +61,7 @@ uvicorn backend:app --reload --port 8000 --env-file .env
 does not load `.env` by itself (Docker Compose injects the file for you). Without
 it, searches still work but every response is `list_only`.
 
-`DB_PATH` is relative, so always start uvicorn from the repository root.
+`DB_PATH` is relative, so always start uvicorn from this directory (`backend/`).
 
 **Verify it works**
 
@@ -176,7 +176,7 @@ docker-compose.yml         single service + model cache volume
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `RuntimeError: ChromaDB collection 'undip_research_search' was not found` | Database missing, or uvicorn started from the wrong directory | Build the DB ([docs/DATA.md](docs/DATA.md)) and run from the repo root |
+| `RuntimeError: ChromaDB collection 'undip_research_search' was not found` | Database missing, or uvicorn started from the wrong directory | Build the DB ([docs/DATA.md](docs/DATA.md)) and run from `backend/` |
 | Startup hangs at "Waiting for application startup" with no further output | The repo sits on a network path (`\\wsl.localhost\...`, a share); SQLite blocks on it | Run uvicorn inside WSL, or copy the repo and the DB to a local disk |
 | Startup takes minutes | First-time embedding-model download (~470 MB) | Wait once; the HuggingFace cache (or `model_cache` volume) is reused |
 | `/health` shows `"documents": 0` | Empty collection | Run the ingestion notebook |

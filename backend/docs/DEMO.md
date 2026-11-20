@@ -92,7 +92,7 @@ clears the relevance bar.
 | `status=list_only` with "belum dikonfigurasi" | `.env` not loaded — usually a missing `--env-file .env` | Restart with the flag |
 | `status=list_only` with "tidak merespons tepat waktu" | Gemini was slower than 15 s | Say "the model is slow, here is the list", then retry the query |
 | Empty results on everything | DB is empty, or every query is genuinely off-topic | Check `/health` first; do not lower the threshold just to fill the list |
-| Server will not start (`collection ... was not found`) | Wrong directory or missing DB | Start uvicorn from the repo root; if the DB is missing, switch to screenshots |
+| Server will not start (`collection ... was not found`) | Wrong directory or missing DB | Start uvicorn from `backend/`; if the DB is missing, switch to screenshots |
 | Network is down | Gemini is unreachable | Screenshots of a `full` response; the retrieval path works offline |
 
 ## Q&A crib sheet

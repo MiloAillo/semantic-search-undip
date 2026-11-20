@@ -1,3 +1,5 @@
+name: undip-search
+
 services:
   aisen-api:
     build:

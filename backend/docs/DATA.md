@@ -134,7 +134,7 @@ notebook's first cell and is only needed for harvesting.
 | Fewer than 1,000 records saved | The OAI stream ended early, or the loop hit an exception | Read the printed error and re-run; the count is not a filter problem |
 | `eprints_undip_clean.json` missing after an error | The whole harvest is wrapped in a broad `try/except` | Re-run the cell; the file is only written on success |
 | Chroma rejects an insert batch | Batch over the ~5,461 cap | Keep the 1,000-record batching |
-| `documents: 0` in `/health` after ingest | Wrong `DB_PATH` (relative to CWD) | Run the notebook and the server from the repo root |
+| `documents: 0` in `/health` after ingest | Wrong `DB_PATH` (relative to CWD) | Run the notebook and the server from `backend/` |
 | Search results look random | Collection not built with `hnsw:space=cosine` | Recreate the collection (cell 3) |
 | Docker sees no data | `./eprints_vector_db` missing on the host | Build it on the host; compose bind-mounts it |
 | Container exits with `attempt to write a readonly database` | The bind-mounted DB is owned by your UID, the image runs as a different UID | Build with `APP_UID=$(id -u) docker compose up -d --build`; `chmod -R a+rwX eprints_vector_db` is a stopgap |
