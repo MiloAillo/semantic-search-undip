@@ -98,14 +98,30 @@ def test_tidak_ada_jurnal_lolos_memberi_arahan():
     assert body["arahan"] and body["ringkasan"] is None
 
 
+def test_threshold_bawaan_menyaring_di_batas_ukur():
+    # Jarak 0.45 -> kemiripan 0.55: lolos di default hasil kalibrasi.
+    body = make_client([0.45]).post("/search", json={"query": "x"}).json()
+    assert body["threshold"] == backend.THRESHOLD_DEFAULT
+    assert body["count"] == 1
+
+
+def test_threshold_bawaan_menolak_skor_di_bawahnya():
+    # Jarak 0.5 -> kemiripan 0.5: di bawah default, jadi hasil kosong.
+    body = make_client([0.5]).post("/search", json={"query": "x"}).json()
+    assert body["threshold"] == backend.THRESHOLD_DEFAULT
+    assert body["status"] == "no_results"
+
+
 def test_no_results_menyebut_skor_tertinggi():
     # jarak 0.9 -> kemiripan 0.099...; threshold 0.5 tidak meloloskan apa pun.
     body = make_client([0.9]).post(
         "/search", json={"query": "x", "threshold": 0.5}
     ).json()
     assert body["skor_tertinggi"] == 0.1
-    assert "0.10" in body["arahan"][0]
-    assert "turunkan threshold" in body["arahan"][0]
+    assert "ambang kemiripan 0.50" in body["arahan"][0]
+    assert "0.10" in body["arahan"][1]
+    # Relevansi tidak dinegosiasikan: jangan menyarankan menurunkan threshold.
+    assert not any("turunkan threshold" in a.lower() for a in body["arahan"])
 
 
 def test_cors_mengizinkan_frontend_dari_origin_lain():
