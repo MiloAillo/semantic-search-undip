@@ -18,10 +18,11 @@ COLLECTION_NAME = "undip_research_search"
 N_RESULTS = 100
 
 # Threshold = kemiripan minimum (1 - jarak cosine). Makin tinggi = makin ketat.
-# Batas bawah/atas slider UI. NILAI AWAL, setel setelah mencoba data asli.
+# Batas bawah/atas slider UI. Nilai bawaan diukur dengan calibrate_threshold.py
+# pada 1.000 dokumen asli (eprints2): query relevan 0.58-0.73, noise <= 0.46.
 THRESHOLD_MIN = 0.1
 THRESHOLD_MAX = 0.9
-THRESHOLD_DEFAULT = 0.5
+THRESHOLD_DEFAULT = 0.53
 
 # Jumlah jurnal teratas yang dikirim ke LLM (angka awal, bisa disetel tim).
 SUMMARY_TOP_K = 5
@@ -32,10 +33,11 @@ SUMMARY_TOP_K = 5
 # pengguna menunggu terlalu lama saat LLM benar-benar tidak merespons.
 LLM_TIMEOUT_SECONDS = 15
 
-# Isi "arahan praktis" saat tidak ada jurnal yang lolos threshold.
+# Arahan saat tidak ada jurnal yang lolos threshold. Bersifat diagnostik:
+# menjelaskan mengapa hasilnya kosong, tanpa menyuruh pengguna menurunkan
+# ambang relevansi. Hasil kosong adalah jawaban yang sah.
 GUIDANCE = [
-    "Turunkan threshold agar hasil lebih longgar.",
-    "Coba kata kunci lain.",
+    "Coba kata kunci yang lebih spesifik.",
     "Perluas topik pencarian.",
 ]
 
@@ -115,7 +117,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Undip Research Semantic Search API",
-    description="Semantic search over the harvested Undip eprints repository.",
+    description="Semantic search over the harvested Undip eprints2 repository.",
     version="0.2.0",
     lifespan=lifespan,
 )
@@ -314,13 +316,15 @@ async def search(payload: SearchRequest) -> SearchResponse:
         status = "no_results"
         distances = raw["distances"][0] if raw["distances"] else []
         if distances:
-            # Kasus paling umum: threshold terlalu ketat. Sebutkan angka
-            # nyatanya supaya pengguna (atau panitia demo) tahu harus ke mana.
+            # Laporkan fakta: ambang yang dipakai dan skor tertinggi yang ada.
+            # Tidak menyarankan menurunkan threshold, karena ambang itu memang
+            # penjaga relevansi dan hasil kosong adalah jawaban yang sah.
             skor_tertinggi = round(1.0 - distances[0], 6)
             arahan = [
-                f"Kemiripan tertinggi yang ditemukan {skor_tertinggi:.2f}; "
-                "turunkan threshold di bawah nilai itu.",
-                *GUIDANCE[1:],
+                f"Tidak ada jurnal yang mencapai ambang kemiripan "
+                f"{payload.threshold:.2f}.",
+                f"Kemiripan tertinggi yang ditemukan: {skor_tertinggi:.2f}.",
+                *GUIDANCE,
             ]
         else:
             # DB kosong / belum di-ingest: jangan menyarankan menurunkan
